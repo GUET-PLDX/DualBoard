@@ -20,9 +20,9 @@ required_hardware:
   - can
 
 depends:
-  - qdu-future/CMD
-  - qdu-future/Chassis
-  - qdu-future/Referee
+  - pldx/CMD
+  - pldx/Chassis
+  - pldx/Referee
 === END MANIFEST === */
 // clang-format on
 
