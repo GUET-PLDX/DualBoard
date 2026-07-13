@@ -27,8 +27,10 @@ depends:
 // clang-format on
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #include "CMD.hpp"
 #include "Chassis.hpp"
@@ -126,6 +128,12 @@ class DualBoard : public LibXR::Application {
     uint8_t reserved2;
   };
 
+  struct __attribute__((packed)) MotionFrame {
+    int16_t gyro_z_q;
+    uint8_t gyro_valid;
+    uint8_t reserved[5];
+  };
+
   struct __attribute__((packed)) AttitudeFrame {
     int16_t roll;
     int16_t pitch;
@@ -153,6 +161,7 @@ class DualBoard : public LibXR::Application {
   static constexpr float COMMAND_LIMIT = 1.0f;
   static constexpr float ANGLE_SCALE = 10000.0f;
   static constexpr float ANGLE_LIMIT = 3.2f;
+  static constexpr float GYRO_SCALE = 900.0f;
   static constexpr float BULLET_SPEED_SCALE = 10.0f;
   static constexpr float BULLET_SPEED_LIMIT = 25.5f;
 
@@ -160,6 +169,8 @@ class DualBoard : public LibXR::Application {
                 "ControlFrame must be one classic CAN frame");
   static_assert(sizeof(AngleFrame) == 8,
                 "AngleFrame must be one classic CAN frame");
+  static_assert(sizeof(MotionFrame) == 8,
+                "MotionFrame must be one classic CAN frame");
   static_assert(sizeof(AttitudeFrame) == 8,
                 "AttitudeFrame must be one classic CAN frame");
   static_assert(sizeof(LauncherFeedbackFrame) == 8,
@@ -224,6 +235,9 @@ class DualBoard : public LibXR::Application {
       RegisterTopicCallback<LibXR::EulerAngle<float>,
                             &DualBoard::OnLocalAttitude>("gimbal_euler");
 
+      chassis_gyro_z_topic_ = LibXR::Topic(
+          LibXR::Topic::FindOrCreate<float>("chassis_gyro_z", nullptr, false));
+
       launcher_ref_topic_ = CreateTopic<Referee::LauncherPack>("launcher_ref");
       sentry_ref_topic_ =
           CreateTopic<Referee::RobotGameRefereePack>("sentry_ref");
@@ -237,6 +251,8 @@ class DualBoard : public LibXR::Application {
       RegisterTopicCallback<Referee::LauncherPack,
                             &DualBoard::OnLocalLauncherFeedback>(
           "launcher_ref");
+      RegisterTopicCallback<Eigen::Matrix<float, 3, 1>,
+                            &DualBoard::OnLocalChassisGyro>("chassis_gyro");
     }
   }
 
@@ -295,8 +311,7 @@ class DualBoard : public LibXR::Application {
           this);
 
       cmd_->GetEvent().Register(CMD::CMD_EVENT_LOST_CTRL, lost_ctrl_callback);
-      cmd_->GetEvent().Register(CMD::CMD_EVENT_START_CTRL,
-                                start_ctrl_callback);
+      cmd_->GetEvent().Register(CMD::CMD_EVENT_START_CTRL, start_ctrl_callback);
     }
   }
 
@@ -363,6 +378,16 @@ class DualBoard : public LibXR::Application {
     }
   }
 
+  void OnLocalChassisGyro(const Eigen::Matrix<float, 3, 1>& gyro) {
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      local_chassis_gyro_ = gyro;
+      chassis_gyro_received_ = true;
+    } else {
+      UNUSED(gyro);
+    }
+  }
+
   void OnLocalModeEvent(uint32_t event_id) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       if (!IsSupportedMode(event_id)) {
@@ -412,12 +437,43 @@ class DualBoard : public LibXR::Application {
         SendGimbalControlFrames(now_ms);
         CheckOffline(now_ms);
       } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
+        SendMotionFrameIfDue(now_ms);
         SendLauncherFeedbackFrameIfDue(now_ms);
         CheckOffline(now_ms);
       }
 
       protocol_thread_.SleepUntil(last_time, PROTOCOL_THREAD_PERIOD_MS);
     }
+  }
+
+  void SendMotionFrameIfDue(uint32_t now_ms) {
+    if (!IsDue(now_ms, next_control_tx_ms_, CONTROL_PERIOD_MS)) {
+      return;
+    }
+
+    Eigen::Matrix<float, 3, 1> gyro{};
+    bool gyro_received = false;
+    {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      gyro = local_chassis_gyro_;
+      gyro_received = chassis_gyro_received_;
+    }
+
+    MotionFrame frame{};
+    float gyro_z = 0.0f;
+    if (gyro_received) {
+      gyro_z = gyro.z();
+    }
+    if (gyro_received && std::isfinite(gyro_z)) {
+      float gyro_z_q = gyro_z * GYRO_SCALE;
+      if (gyro_z_q >= static_cast<float>(std::numeric_limits<int16_t>::min()) &&
+          gyro_z_q <= static_cast<float>(std::numeric_limits<int16_t>::max())) {
+        frame.gyro_z_q = static_cast<int16_t>(gyro_z_q);
+        frame.gyro_valid = 1U;
+      }
+    }
+
+    SendClassicFrame(tx_id_ + ANGLE_ID_OFFSET, frame);
   }
 
   void SendGimbalControlFrames(uint32_t now_ms) {
@@ -523,7 +579,32 @@ class DualBoard : public LibXR::Application {
     } else if constexpr (ROLE == DualBoardRole::GIMBAL) {
       if (offset == CONTROL_ID_OFFSET) {
         HandleLauncherFeedbackFrame(pack);
+      } else if (offset == ANGLE_ID_OFFSET) {
+        HandleMotionFrame(pack);
       }
+    }
+  }
+
+  void HandleMotionFrame(const LibXR::CAN::ClassicPack& pack) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      MotionFrame frame{};
+      std::memcpy(&frame, pack.data, sizeof(frame));
+
+      float gyro_z = 0.0f;
+      if (frame.gyro_valid == 1U) {
+        gyro_z = DecodeSigned(frame.gyro_z_q, GYRO_SCALE);
+      }
+      {
+        LibXR::Mutex::LockGuard lock(data_mutex_);
+        chassis_gyro_z_topic_.Publish(gyro_z);
+      }
+
+      last_rx_time_ms_ =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+      online_ = true;
+      safe_state_published_ = false;
+    } else {
+      UNUSED(pack);
     }
   }
 
@@ -645,8 +726,12 @@ class DualBoard : public LibXR::Application {
       Referee::LauncherPack launcher_pack{};
       launcher_ref_topic_.Publish(launcher_pack);
 
-      LibXR::Mutex::LockGuard lock(data_mutex_);
-      launcher_feedback_valid_ = false;
+      {
+        LibXR::Mutex::LockGuard lock(data_mutex_);
+        float gyro_z = 0.0f;
+        chassis_gyro_z_topic_.Publish(gyro_z);
+        launcher_feedback_valid_ = false;
+      }
     }
   }
 
@@ -704,6 +789,7 @@ class DualBoard : public LibXR::Application {
   LibXR::Topic launcher_ref_topic_;
   LibXR::Topic sentry_ref_topic_;
   LibXR::Topic sentry_state_topic_;
+  LibXR::Topic chassis_gyro_z_topic_;
   LibXR::Event dual_board_event_;
   LibXR::CAN::Callback can_rx_callback_;
 
@@ -721,6 +807,8 @@ class DualBoard : public LibXR::Application {
   bool local_mode_valid_ = false;
   Referee::LauncherPack local_launcher_pack_{};
   bool launcher_feedback_valid_ = false;
+  Eigen::Matrix<float, 3, 1> local_chassis_gyro_{};
+  bool chassis_gyro_received_ = false;
 
   uint32_t next_control_tx_ms_ = 0;
   uint32_t next_launcher_feedback_tx_ms_ = 0;
