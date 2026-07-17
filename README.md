@@ -4,8 +4,8 @@
 
 ## 角色
 
-- `DualBoard<DualBoardRole::GIMBAL, Omni>`：云台板，缓存本地 `chassis_cmd`、云台机械角、云台姿态和底盘模式，按 10 ms 周期发给底盘板；接收底盘板的发射裁判摘要并发布为 `launcher_ref`。
-- `DualBoard<DualBoardRole::CHASSIS, Omni>`：底盘板，接收云台板固定帧并重新发布为本地 LibXR Topic；监听本地 `launcher_ref`，按 20 ms 周期压缩回传给云台板。
+- `DualBoard<DualBoardRole::GIMBAL, Omni>`：云台板，发送运动控制帧，接收底盘板裁判帧，完整重组后发布本地 `sentry_ref`。
+- `DualBoard<DualBoardRole::CHASSIS, Omni>`：底盘板，接收运动控制帧；监听底盘本地 `sentry_ref`，通过固定 CAN2 业务帧发送给云台板。
 
 默认 CAN ID 沿用参考工程方向习惯：
 
@@ -26,6 +26,25 @@
 |---|---:|---:|---|
 | `tx_id + 0x00` | 20 ms | 8 | 发射模块使用的热量上限、冷却、当前热量、弹速和机器人等级 |
 | `tx_id + 0x10` | 10 ms | 8 | `chassis_gyro.z()`，按 900 LSB/(rad/s) 定点编码，含有效标志 |
+
+裁判系统固定帧使用底盘发送基址 `0x311`：
+
+| CAN ID | 内容 |
+|---|---|
+| `0x313` | 比赛状态 |
+| `0x314` | 场地事件 |
+| `0x315-0x317` | 全场 HP（2026 友敌相对字段） |
+| `0x318-0x31A` | 机器人性能体系 |
+| `0x31B-0x31C` | 功率和热量 |
+| `0x31D-0x31E` | Buff |
+| `0x31F-0x320` | 允许发弹量 |
+| `0x323` | RFID |
+| `0x324` | 伤害状态 |
+| `0x325-0x326` | 本机位置 |
+| `0x327` | 裁判链路与源有效位 |
+
+多帧业务每帧携带 1 字节序号和 7 字节数据。重组器在全部分片到齐后才发布，
+混合序号会重置，20 ms 未完成会过期，重复完成帧不会重复发布。
 
 ## 构造参数
 
@@ -64,7 +83,7 @@ Chassis -> Gimbal：
 - `launcher_ref`，类型 `Referee::LauncherPack`，仅回填发射模块实际消费的摘要字段
 - `chassis_gyro`，类型 `Eigen::Matrix<float, 3, 1>`，底盘侧 BMI088 输入
 - `chassis_gyro_z`，类型 `float`，云台侧单发布者 Topic；无效帧或完整链路失联时发布零
-- `sentry_ref`，类型 `Referee::RobotGameRefereePack`，当前仅保留 Topic 兼容，不进入 CAN2 运动链路
+- `sentry_ref`，类型 `Referee::RobotGameRefereePack`，底盘侧为 CAN2 输入，云台侧为完整重组后的本地输出
 - `sentry_state`，类型 `uint8_t`，当前仅保留 Topic 兼容
 
 `GetEvent()` 暴露给 `EventBinder`。云台侧收到 `Omni::ChassisMode` 事件后更新周期控制帧中的模式字段；如果构造参数注入了可选的 `cmd`，云台侧还会监听 `CMD_EVENT_LOST_CTRL` 和 `CMD_EVENT_START_CTRL`，将本地底盘模式和底盘命令缓存降级为 `RELAX`/零命令，使下一帧控制帧不再携带断联前的旧模式。底盘侧仅在模式变化或链路恢复时调用 `chassis->GetEvent().Active(mode)`，避免 10 ms 周期帧反复重置底盘 PID。
@@ -77,4 +96,4 @@ Chassis -> Gimbal：
 
 - 当前版本只支持 Classic CAN 8 字节帧。
 - `rx_buffer_size` 和 `tx_slot_count` 继续保留为构造参数，以保持 YAML/xrobot 构造契约兼容。
-- 完整 `sentry_ref` 大包不再通过 CAN2 透传；若上位机后续确实需要完整裁判摘要，应设计独立低频链路或专用摘要字段。
+- 裁判数据只走上述固定 CAN2 业务帧；`SharedTopicClient` 不传输 `sentry_ref`。

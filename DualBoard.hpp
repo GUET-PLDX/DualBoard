@@ -35,6 +35,7 @@ depends:
 #include "CMD.hpp"
 #include "Chassis.hpp"
 #include "Referee.hpp"
+#include "RefereeCanCodec.hpp"
 #include "app_framework.hpp"
 #include "can.hpp"
 #include "libxr_def.hpp"
@@ -150,12 +151,53 @@ class DualBoard : public LibXR::Application {
     uint8_t robot_level;
   };
 
+  using RefereeFragmentFrame = RefereeCanCodec::FragmentFrame;
+
+  struct __attribute__((packed)) RefereeLinkStatusFrame {
+    uint8_t sequence;
+    uint8_t referee_online;
+    uint16_t supported_mask;
+    uint16_t valid_mask;
+    uint8_t reserved[2];
+  };
+
+  struct __attribute__((packed)) RefereeGameStatusData {
+    uint8_t game_type;
+    uint8_t game_progress;
+    uint16_t stage_remain_time;
+  };
+
+  using RefereeAssembly = RefereeCanCodec::Assembly;
+
   static constexpr uint32_t CONTROL_PERIOD_MS = 10;
   static constexpr uint32_t LAUNCHER_FEEDBACK_PERIOD_MS = 20;
   static constexpr uint32_t PROTOCOL_THREAD_PERIOD_MS = 2;
   static constexpr uint32_t CONTROL_ID_OFFSET = 0x00U;
   static constexpr uint32_t ANGLE_ID_OFFSET = 0x10U;
   static constexpr uint32_t ATTITUDE_ID_OFFSET = 0x20U;
+  static constexpr uint32_t REFEREE_GAME_STATUS_ID_OFFSET =
+      RefereeCanCodec::GAME_STATUS_ID_OFFSET;
+  static constexpr uint32_t REFEREE_FIELD_EVENT_ID_OFFSET =
+      RefereeCanCodec::FIELD_EVENT_ID_OFFSET;
+  static constexpr uint32_t REFEREE_ROBOT_HP_ID_OFFSET =
+      RefereeCanCodec::ROBOT_HP_ID_OFFSET;
+  static constexpr uint32_t REFEREE_ROBOT_STATUS_ID_OFFSET =
+      RefereeCanCodec::ROBOT_STATUS_ID_OFFSET;
+  static constexpr uint32_t REFEREE_POWER_HEAT_ID_OFFSET =
+      RefereeCanCodec::POWER_HEAT_ID_OFFSET;
+  static constexpr uint32_t REFEREE_ROBOT_BUFF_ID_OFFSET =
+      RefereeCanCodec::ROBOT_BUFF_ID_OFFSET;
+  static constexpr uint32_t REFEREE_BULLET_REMAIN_ID_OFFSET =
+      RefereeCanCodec::BULLET_REMAIN_ID_OFFSET;
+  static constexpr uint32_t REFEREE_RFID_ID_OFFSET =
+      RefereeCanCodec::RFID_ID_OFFSET;
+  static constexpr uint32_t REFEREE_ROBOT_DAMAGE_ID_OFFSET =
+      RefereeCanCodec::ROBOT_DAMAGE_ID_OFFSET;
+  static constexpr uint32_t REFEREE_ROBOT_POS_ID_OFFSET =
+      RefereeCanCodec::ROBOT_POS_ID_OFFSET;
+  static constexpr uint32_t REFEREE_LINK_STATUS_ID_OFFSET =
+      RefereeCanCodec::LINK_STATUS_ID_OFFSET;
+  static constexpr uint32_t REFEREE_STATUS_PERIOD_MS = 1000U;
   static constexpr uint32_t RX_ID_RANGE = ATTITUDE_ID_OFFSET;
   static constexpr float COMMAND_SCALE = 32767.0f;
   static constexpr float COMMAND_LIMIT = 1.0f;
@@ -175,6 +217,10 @@ class DualBoard : public LibXR::Application {
                 "AttitudeFrame must be one classic CAN frame");
   static_assert(sizeof(LauncherFeedbackFrame) == 8,
                 "LauncherFeedbackFrame must be one classic CAN frame");
+  static_assert(sizeof(RefereeFragmentFrame) == 8,
+                "RefereeFragmentFrame must be one classic CAN frame");
+  static_assert(sizeof(RefereeLinkStatusFrame) == 8,
+                "RefereeLinkStatusFrame must be one classic CAN frame");
 
   static void RxThreadEntry(DualBoard* self) { self->RunRxThread(); }
 
@@ -217,6 +263,33 @@ class DualBoard : public LibXR::Application {
     return true;
   }
 
+  static uint16_t SourceMaskForCommand(Referee::CommandID command_id) {
+    switch (command_id) {
+      case Referee::CommandID::REF_CMD_ID_GAME_STATUS:
+        return Referee::SOURCE_GAME_STATUS;
+      case Referee::CommandID::REF_CMD_ID_GAME_ROBOT_HP:
+        return Referee::SOURCE_ROBOT_HP;
+      case Referee::CommandID::REF_CMD_ID_FIELD_EVENTS:
+        return Referee::SOURCE_FIELD_EVENT;
+      case Referee::CommandID::REF_CMD_ID_ROBOT_STATUS:
+        return Referee::SOURCE_ROBOT_STATUS;
+      case Referee::CommandID::REF_CMD_ID_POWER_HEAT_DATA:
+        return Referee::SOURCE_POWER_HEAT;
+      case Referee::CommandID::REF_CMD_ID_ROBOT_POS:
+        return Referee::SOURCE_ROBOT_POS;
+      case Referee::CommandID::REF_CMD_ID_ROBOT_BUFF:
+        return Referee::SOURCE_ROBOT_BUFF;
+      case Referee::CommandID::REF_CMD_ID_ROBOT_DMG:
+        return Referee::SOURCE_ROBOT_DAMAGE;
+      case Referee::CommandID::REF_CMD_ID_BULLET_REMAINING:
+        return Referee::SOURCE_BULLET_REMAIN;
+      case Referee::CommandID::REF_CMD_ID_RFID:
+        return Referee::SOURCE_RFID;
+      default:
+        return 0U;
+    }
+  }
+
   template <typename Data>
   LibXR::Topic CreateTopic(const char* name) {
     return LibXR::Topic::CreateTopic<Data>(name, nullptr, true);
@@ -251,6 +324,8 @@ class DualBoard : public LibXR::Application {
       RegisterTopicCallback<Referee::LauncherPack,
                             &DualBoard::OnLocalLauncherFeedback>(
           "launcher_ref");
+      RegisterTopicCallback<Referee::RobotGameRefereePack,
+                            &DualBoard::OnLocalSentryRef>("sentry_ref");
       RegisterTopicCallback<Eigen::Matrix<float, 3, 1>,
                             &DualBoard::OnLocalChassisGyro>("chassis_gyro");
     }
@@ -378,6 +453,18 @@ class DualBoard : public LibXR::Application {
     }
   }
 
+  void OnLocalSentryRef(const Referee::RobotGameRefereePack& referee_pack) {
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      local_sentry_ref_ = referee_pack;
+      pending_referee_sources_ |= SourceMaskForCommand(
+          static_cast<Referee::CommandID>(referee_pack.source_command_id));
+      referee_status_pending_ = true;
+    } else {
+      UNUSED(referee_pack);
+    }
+  }
+
   void OnLocalChassisGyro(const Eigen::Matrix<float, 3, 1>& gyro) {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
@@ -439,6 +526,7 @@ class DualBoard : public LibXR::Application {
       } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
         SendMotionFrameIfDue(now_ms);
         SendLauncherFeedbackFrameIfDue(now_ms);
+        SendRefereeFramesIfDue(now_ms);
         CheckOffline(now_ms);
       }
 
@@ -552,6 +640,89 @@ class DualBoard : public LibXR::Application {
     SendClassicFrame(tx_id_ + CONTROL_ID_OFFSET, frame);
   }
 
+  template <typename Data>
+  void SendRefereeFragments(uint32_t base_offset, uint8_t sequence,
+                            const Data& data) {
+    const auto frames = RefereeCanCodec::Encode(sequence, data);
+    for (size_t index = 0U; index < frames.size(); ++index) {
+      SendClassicFrame(tx_id_ + base_offset + index, frames[index]);
+    }
+  }
+
+  void SendRefereeFramesIfDue(uint32_t now_ms) {
+    if constexpr (ROLE != DualBoardRole::CHASSIS) {
+      UNUSED(now_ms);
+      return;
+    }
+
+    Referee::RobotGameRefereePack referee_pack{};
+    uint16_t pending_sources = 0U;
+    bool status_pending = false;
+    {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      referee_pack = local_sentry_ref_;
+      pending_sources = pending_referee_sources_;
+      pending_referee_sources_ = 0U;
+      status_pending = referee_status_pending_;
+      referee_status_pending_ = false;
+    }
+
+    if ((pending_sources & Referee::SOURCE_GAME_STATUS) != 0U) {
+      RefereeGameStatusData data{referee_pack.game_status.game_type,
+                                 referee_pack.game_status.game_progress,
+                                 referee_pack.game_status.stage_remain_time};
+      SendRefereeFragments(REFEREE_GAME_STATUS_ID_OFFSET,
+                           referee_sequences_[0]++, data);
+    }
+    if ((pending_sources & Referee::SOURCE_ROBOT_HP) != 0U) {
+      SendRefereeFragments(REFEREE_ROBOT_HP_ID_OFFSET, referee_sequences_[1]++,
+                           referee_pack.robot_hp);
+    }
+    if ((pending_sources & Referee::SOURCE_FIELD_EVENT) != 0U) {
+      SendRefereeFragments(REFEREE_FIELD_EVENT_ID_OFFSET,
+                           referee_sequences_[2]++, referee_pack.field_event);
+    }
+    if ((pending_sources & Referee::SOURCE_ROBOT_STATUS) != 0U) {
+      SendRefereeFragments(REFEREE_ROBOT_STATUS_ID_OFFSET,
+                           referee_sequences_[3]++, referee_pack.robot_status);
+    }
+    if ((pending_sources & Referee::SOURCE_POWER_HEAT) != 0U) {
+      SendRefereeFragments(REFEREE_POWER_HEAT_ID_OFFSET,
+                           referee_sequences_[4]++, referee_pack.power_heat);
+    }
+    if ((pending_sources & Referee::SOURCE_ROBOT_POS) != 0U) {
+      SendRefereeFragments(REFEREE_ROBOT_POS_ID_OFFSET, referee_sequences_[5]++,
+                           referee_pack.robot_pos);
+    }
+    if ((pending_sources & Referee::SOURCE_ROBOT_BUFF) != 0U) {
+      SendRefereeFragments(REFEREE_ROBOT_BUFF_ID_OFFSET,
+                           referee_sequences_[6]++, referee_pack.robot_buff);
+    }
+    if ((pending_sources & Referee::SOURCE_ROBOT_DAMAGE) != 0U) {
+      SendRefereeFragments(REFEREE_ROBOT_DAMAGE_ID_OFFSET,
+                           referee_sequences_[7]++, referee_pack.robot_damage);
+    }
+    if ((pending_sources & Referee::SOURCE_BULLET_REMAIN) != 0U) {
+      SendRefereeFragments(REFEREE_BULLET_REMAIN_ID_OFFSET,
+                           referee_sequences_[8]++, referee_pack.bullet_remain);
+    }
+    if ((pending_sources & Referee::SOURCE_RFID) != 0U) {
+      SendRefereeFragments(REFEREE_RFID_ID_OFFSET, referee_sequences_[9]++,
+                           referee_pack.rfid);
+    }
+
+    const bool STATUS_DUE =
+        IsDue(now_ms, next_referee_status_tx_ms_, REFEREE_STATUS_PERIOD_MS);
+    if (status_pending || STATUS_DUE) {
+      RefereeLinkStatusFrame frame{};
+      frame.sequence = referee_status_sequence_++;
+      frame.referee_online = referee_pack.referee_online ? 1U : 0U;
+      frame.supported_mask = Referee::SUPPORTED_SOURCE_MASK;
+      frame.valid_mask = referee_pack.source_valid_mask;
+      SendClassicFrame(tx_id_ + REFEREE_LINK_STATUS_ID_OFFSET, frame);
+    }
+  }
+
   template <typename Frame>
   bool SendClassicFrame(uint32_t id, const Frame& frame) {
     LibXR::CAN::ClassicPack pack{};
@@ -577,12 +748,143 @@ class DualBoard : public LibXR::Application {
         HandleAttitudeFrame(pack);
       }
     } else if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      if (HandleRefereeFrame(offset, pack)) {
+        return;
+      }
       if (offset == CONTROL_ID_OFFSET) {
         HandleLauncherFeedbackFrame(pack);
       } else if (offset == ANGLE_ID_OFFSET) {
         HandleMotionFrame(pack);
       }
     }
+  }
+
+  template <typename Data>
+  bool ReassembleReferee(uint32_t offset, uint32_t base_offset,
+                         uint8_t fragment_count, RefereeAssembly& assembly,
+                         const LibXR::CAN::ClassicPack& pack, uint32_t now_ms,
+                         Data& output, uint16_t source_mask,
+                         Referee::CommandID command_id) {
+    if (offset < base_offset || offset >= base_offset + fragment_count) {
+      return false;
+    }
+
+    RefereeFragmentFrame frame{};
+    std::memcpy(&frame, pack.data, sizeof(frame));
+    const auto result = RefereeCanCodec::Push(
+        assembly, static_cast<size_t>(offset - base_offset), frame, now_ms,
+        output);
+    if (result != RefereeCanCodec::PushResult::COMPLETE) {
+      return true;
+    }
+    local_referee_valid_mask_ |= source_mask;
+    gimbal_sentry_ref_.source_command_id = static_cast<uint16_t>(command_id);
+    gimbal_sentry_ref_.source_valid_mask = RefereeCanCodec::IntersectValidity(
+        upstream_referee_online_, local_referee_valid_mask_,
+        upstream_referee_valid_mask_, Referee::SUPPORTED_SOURCE_MASK);
+    gimbal_sentry_ref_.referee_online = upstream_referee_online_;
+    sentry_ref_topic_.Publish(gimbal_sentry_ref_);
+    return true;
+  }
+
+  bool HandleRefereeFrame(uint32_t offset,
+                          const LibXR::CAN::ClassicPack& pack) {
+    if constexpr (ROLE != DualBoardRole::GIMBAL) {
+      UNUSED(offset);
+      UNUSED(pack);
+      return false;
+    }
+    const uint32_t now_ms =
+        static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+    if (offset == REFEREE_LINK_STATUS_ID_OFFSET) {
+      RefereeLinkStatusFrame frame{};
+      std::memcpy(&frame, pack.data, sizeof(frame));
+      upstream_referee_online_ = frame.referee_online == 1U;
+      upstream_referee_valid_mask_ = frame.valid_mask & frame.supported_mask;
+      if (!upstream_referee_online_) {
+        local_referee_valid_mask_ = 0U;
+      }
+      gimbal_sentry_ref_.source_command_id = 0U;
+      gimbal_sentry_ref_.source_valid_mask = RefereeCanCodec::IntersectValidity(
+          upstream_referee_online_, local_referee_valid_mask_,
+          upstream_referee_valid_mask_, Referee::SUPPORTED_SOURCE_MASK);
+      gimbal_sentry_ref_.referee_online = upstream_referee_online_;
+      sentry_ref_topic_.Publish(gimbal_sentry_ref_);
+      last_rx_time_ms_ = now_ms;
+      online_ = true;
+      safe_state_published_ = false;
+      return true;
+    }
+    if (offset == REFEREE_GAME_STATUS_ID_OFFSET) {
+      RefereeFragmentFrame frame{};
+      std::memcpy(&frame, pack.data, sizeof(frame));
+      auto& assembly = referee_assemblies_[0];
+      if (assembly.has_published &&
+          assembly.published_sequence == frame.sequence) {
+        return true;
+      }
+      assembly.has_published = true;
+      assembly.published_sequence = frame.sequence;
+      gimbal_sentry_ref_.game_status.game_type = frame.data[0];
+      gimbal_sentry_ref_.game_status.game_progress = frame.data[1];
+      std::memcpy(&gimbal_sentry_ref_.game_status.stage_remain_time,
+                  &frame.data[2], sizeof(uint16_t));
+      local_referee_valid_mask_ |= Referee::SOURCE_GAME_STATUS;
+      gimbal_sentry_ref_.source_command_id =
+          static_cast<uint16_t>(Referee::CommandID::REF_CMD_ID_GAME_STATUS);
+      gimbal_sentry_ref_.source_valid_mask = RefereeCanCodec::IntersectValidity(
+          upstream_referee_online_, local_referee_valid_mask_,
+          upstream_referee_valid_mask_, Referee::SUPPORTED_SOURCE_MASK);
+      gimbal_sentry_ref_.referee_online = upstream_referee_online_;
+      sentry_ref_topic_.Publish(gimbal_sentry_ref_);
+      last_rx_time_ms_ = now_ms;
+      online_ = true;
+      safe_state_published_ = false;
+      return true;
+    }
+
+#define HANDLE_REFEREE_GROUP(BASE, COUNT, STATE, FIELD, MASK, COMMAND) \
+  if (ReassembleReferee(offset, BASE, COUNT, STATE, pack, now_ms,      \
+                        gimbal_sentry_ref_.FIELD, MASK, COMMAND)) {    \
+    last_rx_time_ms_ = now_ms;                                         \
+    online_ = true;                                                    \
+    safe_state_published_ = false;                                     \
+    return true;                                                       \
+  }
+    HANDLE_REFEREE_GROUP(REFEREE_ROBOT_HP_ID_OFFSET, 3U, referee_assemblies_[1],
+                         robot_hp, Referee::SOURCE_ROBOT_HP,
+                         Referee::CommandID::REF_CMD_ID_GAME_ROBOT_HP)
+    HANDLE_REFEREE_GROUP(REFEREE_FIELD_EVENT_ID_OFFSET, 1U,
+                         referee_assemblies_[2], field_event,
+                         Referee::SOURCE_FIELD_EVENT,
+                         Referee::CommandID::REF_CMD_ID_FIELD_EVENTS)
+    HANDLE_REFEREE_GROUP(REFEREE_ROBOT_STATUS_ID_OFFSET, 3U,
+                         referee_assemblies_[3], robot_status,
+                         Referee::SOURCE_ROBOT_STATUS,
+                         Referee::CommandID::REF_CMD_ID_ROBOT_STATUS)
+    HANDLE_REFEREE_GROUP(REFEREE_POWER_HEAT_ID_OFFSET, 2U,
+                         referee_assemblies_[4], power_heat,
+                         Referee::SOURCE_POWER_HEAT,
+                         Referee::CommandID::REF_CMD_ID_POWER_HEAT_DATA)
+    HANDLE_REFEREE_GROUP(
+        REFEREE_ROBOT_POS_ID_OFFSET, 2U, referee_assemblies_[5], robot_pos,
+        Referee::SOURCE_ROBOT_POS, Referee::CommandID::REF_CMD_ID_ROBOT_POS)
+    HANDLE_REFEREE_GROUP(
+        REFEREE_ROBOT_BUFF_ID_OFFSET, 2U, referee_assemblies_[6], robot_buff,
+        Referee::SOURCE_ROBOT_BUFF, Referee::CommandID::REF_CMD_ID_ROBOT_BUFF)
+    HANDLE_REFEREE_GROUP(REFEREE_ROBOT_DAMAGE_ID_OFFSET, 1U,
+                         referee_assemblies_[7], robot_damage,
+                         Referee::SOURCE_ROBOT_DAMAGE,
+                         Referee::CommandID::REF_CMD_ID_ROBOT_DMG)
+    HANDLE_REFEREE_GROUP(REFEREE_BULLET_REMAIN_ID_OFFSET, 2U,
+                         referee_assemblies_[8], bullet_remain,
+                         Referee::SOURCE_BULLET_REMAIN,
+                         Referee::CommandID::REF_CMD_ID_BULLET_REMAINING)
+    HANDLE_REFEREE_GROUP(REFEREE_RFID_ID_OFFSET, 1U, referee_assemblies_[9],
+                         rfid, Referee::SOURCE_RFID,
+                         Referee::CommandID::REF_CMD_ID_RFID)
+#undef HANDLE_REFEREE_GROUP
+    return false;
   }
 
   void HandleMotionFrame(const LibXR::CAN::ClassicPack& pack) {
@@ -725,6 +1027,7 @@ class DualBoard : public LibXR::Application {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       Referee::LauncherPack launcher_pack{};
       launcher_ref_topic_.Publish(launcher_pack);
+      PublishInvalidReferee();
 
       {
         LibXR::Mutex::LockGuard lock(data_mutex_);
@@ -732,6 +1035,18 @@ class DualBoard : public LibXR::Application {
         chassis_gyro_z_topic_.Publish(gyro_z);
         launcher_feedback_valid_ = false;
       }
+    }
+  }
+
+  void PublishInvalidReferee() {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      local_referee_valid_mask_ = 0U;
+      upstream_referee_valid_mask_ = 0U;
+      upstream_referee_online_ = false;
+      gimbal_sentry_ref_.source_command_id = 0U;
+      gimbal_sentry_ref_.source_valid_mask = 0U;
+      gimbal_sentry_ref_.referee_online = false;
+      sentry_ref_topic_.Publish(gimbal_sentry_ref_);
     }
   }
 
@@ -806,15 +1121,26 @@ class DualBoard : public LibXR::Application {
   uint8_t local_chassis_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
   bool local_mode_valid_ = false;
   Referee::LauncherPack local_launcher_pack_{};
+  Referee::RobotGameRefereePack local_sentry_ref_{};
+  uint16_t pending_referee_sources_ = 0U;
+  bool referee_status_pending_ = false;
+  Referee::RobotGameRefereePack gimbal_sentry_ref_{};
+  RefereeAssembly referee_assemblies_[10]{};
+  uint16_t local_referee_valid_mask_ = 0U;
+  uint16_t upstream_referee_valid_mask_ = 0U;
+  bool upstream_referee_online_ = false;
   bool launcher_feedback_valid_ = false;
   Eigen::Matrix<float, 3, 1> local_chassis_gyro_{};
   bool chassis_gyro_received_ = false;
 
   uint32_t next_control_tx_ms_ = 0;
   uint32_t next_launcher_feedback_tx_ms_ = 0;
+  uint32_t next_referee_status_tx_ms_ = 0U;
   uint32_t last_rx_time_ms_ = 0;
   uint8_t remote_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
   uint8_t tx_sequence_ = 0;
+  uint8_t referee_sequences_[10]{};
+  uint8_t referee_status_sequence_ = 0U;
   bool online_ = false;
   bool safe_state_published_ = false;
 };
