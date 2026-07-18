@@ -6,6 +6,9 @@ on:
   schedule:
     - cron: '0 3 1 * *'  # 每月1日凌晨3点（UTC）自动触发
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -53,6 +56,48 @@ jobs:
 
       - name: Pull libxr to ./libxr
         run: git clone --depth=1 https://github.com/Jiu-xiao/libxr ./libxr
+
+      - name: Checkout CMD module
+        uses: actions/checkout@v4
+        with:
+          repository: GUET-PLDX/CMD
+          path: Modules/CMD
+
+      - name: Checkout Chassis module
+        uses: actions/checkout@v4
+        with:
+          repository: GUET-PLDX/Chassis
+          path: Modules/Chassis
+
+      - name: Checkout Referee module
+        uses: actions/checkout@v4
+        with:
+          repository: GUET-PLDX/Referee
+          path: Modules/Referee
+
+      - name: Checkout Motor module
+        uses: actions/checkout@v4
+        with:
+          repository: GUET-PLDX/Motor
+          path: Modules/Motor
+
+      - name: Checkout RMMotor module
+        uses: actions/checkout@v4
+        with:
+          repository: GUET-PLDX/RMMotor
+          path: Modules/RMMotor
+
+      - name: Checkout PowerControl module
+        uses: actions/checkout@v4
+        with:
+          repository: GUET-PLDX/PowerControl
+          path: Modules/PowerControl
+
+      - name: Checkout SuperPower module
+        uses: actions/checkout@v4
+        with:
+          repository: GUET-PLDX/SuperPower
+          path: Modules/SuperPower
 
       - name: Setup Python & Install deps
         run: |
