@@ -37,8 +37,11 @@ need 'static_assert\(sizeof\(MotionFrame\) == 8' '8-byte MotionFrame'
 need 'GYRO_SCALE = 900\.0f' 'gyro fixed-point scale'
 need 'tx_id_ \+ ANGLE_ID_OFFSET' '0x10 direction-specific CAN offset'
 need 'CONTROL_PERIOD_MS = 10' '10 ms send period'
-need 'FindOrCreate<float>' 'single-publisher gyro Topic lookup'
-need '"chassis_gyro_z", nullptr, false' 'single-publisher gyro Topic contract'
+need 'FindOrCreate<ChassisMotionState>' 'typed chassis motion state Topic lookup'
+need 'ChassisMotionState.hpp' 'shared chassis motion state contract include'
+need 'CHASSIS_MOTION_STATE_TOPIC_MULTI_PUBLISHER' 'centralized chassis motion state Topic attributes'
+forbid 'FindOrCreate<float>' 'raw gyro Topic lookup'
+forbid 'chassis_gyro_z_topic_' 'raw gyro Topic member'
 need '"chassis_gyro"' 'bottom BMI gyro subscription'
 forbid 'gyro_x_q' 'gyro x payload'
 forbid 'gyro_y_q' 'gyro y payload'
@@ -48,7 +51,7 @@ forbid 'mode_and_flags' 'mode payload'
 motion_body="$(extract_body HandleMotionFrame)"
 motion_flat="$(tr '\n' ' ' <<<"$motion_body")"
 need_in "$motion_flat" \
-  'last_rx_time_ms_ =.*LibXR::Timebase::GetMilliseconds\(\)' \
+  'last_rx_time_ms_ = now_ms' \
   'MotionFrame refreshes the existing DualBoard link timestamp'
 need_in "$motion_body" 'online_ = true' \
   'MotionFrame establishes the existing DualBoard online state'
@@ -87,10 +90,10 @@ need_in "$callback_body" 'local_chassis_gyro_ = gyro' \
 register_body="$(extract_body RegisterRoleTopics)"
 need_in "$register_body" 'RegisterTopicCallback<Eigen::Matrix<float, 3, 1>,' \
   'chassis role subscribes to the BMI088 gyro vector'
-need_in "$register_body" 'FindOrCreate<float>' \
-  'gimbal role directly finds or creates the gyro z Topic'
-need_in "$register_body" '"chassis_gyro_z", nullptr, false' \
-  'gyro z Topic remains single-publisher'
+need_in "$register_body" 'FindOrCreate<ChassisMotionState>' \
+  'gimbal role directly finds or creates the semantic motion state Topic'
+need_in "$register_body" 'CHASSIS_MOTION_STATE_TOPIC_NAME' \
+  'semantic motion state Topic uses centralized contract'
 
 protocol_body="$(extract_body RunProtocolThread)"
 need_in "$protocol_body" 'SendMotionFrameIfDue\(now_ms\)' \
@@ -105,24 +108,33 @@ need_in "$dispatch_body" 'HandleMotionFrame\(pack\)' \
 need_in "$motion_body" 'std::memcpy\(&frame, pack\.data, sizeof\(frame\)\)' \
   'MotionFrame is decoded from the classic CAN payload'
 need_in "$motion_body" 'frame\.gyro_valid == 1U' \
-  'invalid MotionFrames publish zero instead of decoding payload data'
+  'MotionFrame validity flag controls semantic validity'
 need_in "$motion_body" 'DecodeSigned\(frame\.gyro_z_q, GYRO_SCALE\)' \
   'valid MotionFrames decode the fixed-point yaw rate'
-need_in "$motion_body" 'chassis_gyro_z_topic_\.Publish\(gyro_z\)' \
-  'decoded yaw rate is published to the local Topic'
+need_in "$motion_body" 'motion_state_\.yaw_rate_valid' \
+  'decoded validity is published in the semantic state'
+need_in "$motion_body" 'motion_state_\.online = true' \
+  'received MotionFrame publishes online state'
+need_in "$motion_body" 'std::isfinite\(gyro_z\)' \
+  'decoded MotionFrame rejects non-finite samples'
 need_in "$motion_flat" \
-  'LibXR::Mutex::LockGuard lock\(data_mutex_\).*chassis_gyro_z_topic_\.Publish\(gyro_z\)' \
-  'MotionFrame gyro publication is serialized by data_mutex_'
+  'LibXR::Mutex::LockGuard lock\(data_mutex_\).*PublishMotionStateLocked\(\)' \
+  'MotionFrame semantic publication is serialized by data_mutex_'
+need_in "$motion_flat" 'motion_state_\.yaw_rate_rad_s =.*\? gyro_z : 0\.0f' \
+  'invalid MotionFrames publish zero rate'
 
 offline_body="$(extract_body PublishInvalidLauncherFeedback)"
 offline_flat="$(tr '\n' ' ' <<<"$offline_body")"
-need_in "$offline_body" 'float gyro_z = 0\.0f' \
-  'full-link offline handling clears chassis gyro z'
-need_in "$offline_body" 'chassis_gyro_z_topic_\.Publish\(gyro_z\)' \
-  'full-link offline handling publishes zero chassis gyro z'
-need_in "$offline_flat" \
-  'launcher_ref_topic_\.Publish\(launcher_pack\).*LibXR::Mutex::LockGuard lock\(data_mutex_\).*chassis_gyro_z_topic_\.Publish\(gyro_z\)' \
-  'offline gyro publication is serialized without locking launcher publication'
+need_in "$offline_body" 'motion_state_ = \{\}' \
+  'full-link offline handling clears the complete motion state'
+need_in "$offline_body" 'PublishMotionStateLocked\(\)' \
+  'full-link offline handling publishes invalid motion state'
+need_in "$offline_body" 'LibXR::Mutex::LockGuard lock\(data_mutex_\)' \
+  'offline semantic publication is serialized by data_mutex_'
+need_in "$offline_body" 'launcher_ref_topic_\.Publish\(launcher_pack\)' \
+  'offline launcher publication remains available'
+need_in "$offline_body" 'PublishMotionStateLocked\(\)' \
+  'offline semantic state is published'
 
 if [[ "${MOTION_REGRESSION_MUTATION_CHILD:-0}" != "1" ]]; then
   mutant_dir="$(mktemp -d)"
@@ -136,7 +148,7 @@ if [[ "${MOTION_REGRESSION_MUTATION_CHILD:-0}" != "1" ]]; then
     exit 1
   fi
 
-  sed 's/frame.gyro_valid == 1U/true/' "$HEADER" \
+  sed 's/frame.gyro_valid == 1U/true/g' "$HEADER" \
     >"$mutant_dir/ignored_validity.hpp"
   if MOTION_REGRESSION_MUTATION_CHILD=1 bash "$0" \
       "$mutant_dir/ignored_validity.hpp" >/dev/null 2>&1; then
@@ -165,7 +177,7 @@ if [[ "${MOTION_REGRESSION_MUTATION_CHILD:-0}" != "1" ]]; then
     "$HEADER" >"$mutant_dir/unlocked_offline_publish.hpp"
   if MOTION_REGRESSION_MUTATION_CHILD=1 bash "$0" \
       "$mutant_dir/unlocked_offline_publish.hpp" >/dev/null 2>&1; then
-    echo 'mutation survived: unlocked offline gyro publication' >&2
+    echo 'mutation survived: unlocked offline semantic publication' >&2
     exit 1
   fi
 
