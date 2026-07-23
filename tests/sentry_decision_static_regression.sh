@@ -3,6 +3,8 @@ set -euo pipefail
 
 HEADER="${1:-DualBoard.hpp}"
 CONTRACT="${SENTRY_DECISION_CONTRACT:-SentryDecisionFrame.hpp}"
+SENTRY_PROTOCOL_HEADER="${SENTRY_PROTOCOL_HEADER:-../SentryProtocol/SentryProtocol.hpp}"
+CHASSIS_YAML="${SENTRY_CHASSIS_YAML:-../../User/RobotConfig/sentry_chassis.yaml}"
 
 need() {
   rg -q -- "$1" "$HEADER" || { echo "missing: $2" >&2; exit 1; }
@@ -42,7 +44,10 @@ need_in "$dispatch_body" 'HandleDecisionFrame\(pack\)' \
 need 'DECISION_ID_OFFSET = 0x1fU' 'collision-free decision CAN offset'
 need 'SentryDecisionFrame.hpp' 'sentry decision frame contract include'
 need 'struct DecisionUpdate' 'decision callback update payload'
-need 'LibXR::MPMCQueue<DecisionUpdate> decision_updates_\{32\}' \
+need 'DECISION_UPDATE_QUEUE_CAPACITY = 32U' \
+  'fixed decision update drain budget'
+need_in "$(tr '\n' ' ' <"$HEADER")" \
+  'LibXR::MPMCQueue<DecisionUpdate> decision_updates_\{ *DECISION_UPDATE_QUEUE_CAPACITY\}' \
   'bounded decision update queue'
 need 'std::atomic<uint32_t> decision_update_drops_\{0\}' \
   'atomic decision update drop counter'
@@ -55,15 +60,43 @@ need 'SentryDecision::SequenceTracker decision_sequence_tracker_' \
 need 'uint32_t last_decision_rx_time_ms_' 'separate decision freshness timestamp'
 
 register_body="$(extract_body RegisterDecisionTopics)"
+register_flat="$(tr '\n' ' ' <<<"$register_body")"
 for contract in \
-  'FindOrCreate<uint16_t>.*sentry_buy_bullet_num_topic_name_' \
-  'FindOrCreate<uint8_t>.*sentry_remote_buy_bullet_times_topic_name_' \
-  'FindOrCreate<uint8_t>.*sentry_remote_buy_hp_times_topic_name_' \
-  'FindOrCreate<bool>.*sentry_buy_resurrection_topic_name_' \
-  'FindOrCreate<uint8_t>.*sentry_state_topic_name_'; do
-  need_in "$(tr '\n' ' ' <<<"$register_body")" "$contract" \
+  'FindOrCreate<uint16_t>.*sentry_buy_bullet_num_topic_name_, nullptr\)' \
+  'FindOrCreate<uint8_t>.*sentry_remote_buy_bullet_times_topic_name_, nullptr\)' \
+  'FindOrCreate<uint8_t>.*sentry_remote_buy_hp_times_topic_name_, nullptr\)' \
+  'FindOrCreate<bool>.*sentry_buy_resurrection_topic_name_, nullptr\)' \
+  'FindOrCreate<uint8_t>.*sentry_state_topic_name_, nullptr\)'; do
+  need_in "$register_flat" "$contract" \
     "typed decision topic registration: $contract"
 done
+forbid_in "$register_flat" 'FindOrCreate<.*true' \
+  'decision topics opt into multi-publisher mutex mode'
+
+sentry_protocol_flat="$(tr '\n' ' ' <"$SENTRY_PROTOCOL_HEADER")"
+for type_and_name in \
+  'uint16_t.*buy_bullet_topic_name' \
+  'uint8_t.*remote_buy_bullet_times_topic_name' \
+  'uint8_t.*remote_buy_hp_times_topic_name' \
+  'bool.*buy_resurrection_topic_name' \
+  'uint8_t.*state_topic_name'; do
+  rg -q -- "CreateTopic<${type_and_name}" <<<"$sentry_protocol_flat" || {
+    echo "missing: SentryProtocol single-publisher topic: $type_and_name" >&2
+    exit 1
+  }
+done
+if rg -q -- 'CreateTopic<[^)]*, *true\)' <<<"$sentry_protocol_flat"; then
+  echo 'forbidden: SentryProtocol decision topic uses multi-publisher mode' >&2
+  exit 1
+fi
+
+sentry_protocol_line="$(rg -n 'name: SentryProtocol' "$CHASSIS_YAML" | head -1 | cut -d: -f1)"
+dual_board_line="$(rg -n 'name: DualBoard' "$CHASSIS_YAML" | head -1 | cut -d: -f1)"
+if [[ -z "$sentry_protocol_line" || -z "$dual_board_line" ||
+      "$sentry_protocol_line" -ge "$dual_board_line" ]]; then
+  echo 'missing: current chassis startup order with SentryProtocol before DualBoard' >&2
+  exit 1
+fi
 for callback in OnSentryBuyBullet OnSentryRemoteBuyBullet \
   OnSentryRemoteBuyHp OnSentryBuyResurrection OnSentryState; do
   need_in "$register_body" "$callback" "gimbal decision callback: $callback"
@@ -82,6 +115,10 @@ forbid_in "$enqueue_body" 'pending_decision_|active_decision_|data_mutex_' \
   'enqueue path mutates owner-only decision state'
 
 drain_body="$(extract_body DrainDecisionUpdates)"
+drain_flat="$(tr '\n' ' ' <<<"$drain_body")"
+need_in "$drain_flat" \
+  'for \(size_t processed = 0U; processed < DECISION_UPDATE_QUEUE_CAPACITY;' \
+  'bounded decision update drain loop'
 need_in "$drain_body" 'decision_updates_\.Pop' 'protocol-thread decision queue drain'
 need_in "$drain_body" '2047U' 'saturating bullet aggregation'
 need_in "$drain_body" '15U' 'saturating remote-count aggregation'
@@ -162,6 +199,30 @@ if [[ "${SENTRY_DECISION_MUTATION_CHILD:-0}" != "1" ]]; then
   if SENTRY_DECISION_MUTATION_CHILD=1 bash "$0" \
       "$mutant_dir/no_validation.hpp" >/dev/null 2>&1; then
     echo 'mutation survived: receiver skipped validation' >&2
+    exit 1
+  fi
+
+  sed '/void RegisterDecisionTopics/,/^  }/ s/nullptr))/nullptr, true))/' \
+    "$HEADER" >"$mutant_dir/multi_publisher_topics.hpp"
+  if SENTRY_DECISION_MUTATION_CHILD=1 bash "$0" \
+      "$mutant_dir/multi_publisher_topics.hpp" >/dev/null 2>&1; then
+    echo 'mutation survived: decision topics enabled multi-publisher mutex mode' >&2
+    exit 1
+  fi
+
+  sed '/void DrainDecisionUpdates/,/^  }/ s/for (size_t processed/while (size_t processed/' \
+    "$HEADER" >"$mutant_dir/unbounded_drain.hpp"
+  if SENTRY_DECISION_MUTATION_CHILD=1 bash "$0" \
+      "$mutant_dir/unbounded_drain.hpp" >/dev/null 2>&1; then
+    echo 'mutation survived: decision update drain lost its fixed budget' >&2
+    exit 1
+  fi
+
+  sed '/DECISION_UPDATE_QUEUE_CAPACITY = 32U/d' "$HEADER" \
+    >"$mutant_dir/missing_drain_budget.hpp"
+  if SENTRY_DECISION_MUTATION_CHILD=1 bash "$0" \
+      "$mutant_dir/missing_drain_budget.hpp" >/dev/null 2>&1; then
+    echo 'mutation survived: decision update drain budget was removed' >&2
     exit 1
   fi
 

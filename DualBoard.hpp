@@ -34,6 +34,7 @@ depends:
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -238,6 +239,7 @@ class DualBoard : public LibXR::Application {
       RefereeCanCodec::LINK_STATUS_ID_OFFSET;
   static constexpr uint32_t REFEREE_STATUS_PERIOD_MS = 1000U;
   static constexpr uint32_t DECISION_DROP_LOG_PERIOD_MS = 1000U;
+  static constexpr size_t DECISION_UPDATE_QUEUE_CAPACITY = 32U;
   static constexpr uint32_t RX_ID_RANGE = ATTITUDE_ID_OFFSET;
   static constexpr float COMMAND_SCALE = 32767.0f;
   static constexpr float COMMAND_LIMIT = 1.0f;
@@ -375,18 +377,18 @@ class DualBoard : public LibXR::Application {
   void RegisterDecisionTopics() {
     sentry_buy_bullet_num_topic_ =
         LibXR::Topic(LibXR::Topic::FindOrCreate<uint16_t>(
-            sentry_buy_bullet_num_topic_name_, nullptr, true));
+            sentry_buy_bullet_num_topic_name_, nullptr));
     sentry_remote_buy_bullet_times_topic_ =
         LibXR::Topic(LibXR::Topic::FindOrCreate<uint8_t>(
-            sentry_remote_buy_bullet_times_topic_name_, nullptr, true));
+            sentry_remote_buy_bullet_times_topic_name_, nullptr));
     sentry_remote_buy_hp_times_topic_ =
         LibXR::Topic(LibXR::Topic::FindOrCreate<uint8_t>(
-            sentry_remote_buy_hp_times_topic_name_, nullptr, true));
+            sentry_remote_buy_hp_times_topic_name_, nullptr));
     sentry_buy_resurrection_topic_ =
         LibXR::Topic(LibXR::Topic::FindOrCreate<bool>(
-            sentry_buy_resurrection_topic_name_, nullptr, true));
-    sentry_state_topic_ = LibXR::Topic(LibXR::Topic::FindOrCreate<uint8_t>(
-        sentry_state_topic_name_, nullptr, true));
+            sentry_buy_resurrection_topic_name_, nullptr));
+    sentry_state_topic_ = LibXR::Topic(
+        LibXR::Topic::FindOrCreate<uint8_t>(sentry_state_topic_name_, nullptr));
 
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       RegisterTopicCallback<uint16_t, &DualBoard::OnSentryBuyBullet>(
@@ -668,7 +670,11 @@ class DualBoard : public LibXR::Application {
     }
 
     DecisionUpdate update{};
-    while (decision_updates_.Pop(update) == LibXR::ErrorCode::OK) {
+    for (size_t processed = 0U; processed < DECISION_UPDATE_QUEUE_CAPACITY;
+         ++processed) {
+      if (decision_updates_.Pop(update) != LibXR::ErrorCode::OK) {
+        break;
+      }
       switch (update.kind) {
         case DecisionUpdateKind::BUY_BULLET: {
           const uint32_t TOTAL =
@@ -1435,7 +1441,8 @@ class DualBoard : public LibXR::Application {
   LibXR::CAN::Callback can_rx_callback_;
 
   LibXR::MPMCQueue<LibXR::CAN::ClassicPack> rx_frames_;
-  LibXR::MPMCQueue<DecisionUpdate> decision_updates_{32};
+  LibXR::MPMCQueue<DecisionUpdate> decision_updates_{
+      DECISION_UPDATE_QUEUE_CAPACITY};
   std::atomic<uint32_t> decision_update_drops_{0};
   LibXR::Semaphore rx_sem_;
   LibXR::Thread rx_thread_;

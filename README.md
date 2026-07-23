@@ -103,7 +103,10 @@ Chassis -> Gimbal：
 云台五个 decision source Topic 的回调只把 `DecisionUpdate` 放入 32 深度
 `MPMCQueue`；协议线程聚合 pending frame（购弹增量饱和到 `2047`，远程次数饱和到
 `15`，状态和复活值 latest-wins）。active frame 在 retry 期间不可被新回调覆盖，
-CAN 队列满时记录原子 drop counter，并由协议线程限频告警。
+decision callback update queue 满时记录原子 drop counter，并由协议线程限频告警。
+每轮 2 ms owner iteration 最多处理 32 个 update，避免并发持续补充队列时阻塞 retry、
+运动帧、失联检查和告警服务。五个 decision Topic 均保持 single-publisher 属性，兼容
+`SentryProtocol` 与 `DualBoard` 的任一构造顺序，也保证 ISR Topic publish 不进入 mutex。
 
 底盘端先验证版本、有效位和字段范围，再用序列号去重。新序列只发布一次购弹增量，
 并按远程请求次数发布 `uint8_t{1}`；复活和状态各发布一次 level 值。重复帧只刷新
