@@ -13,6 +13,11 @@ constructor_args:
   - chassis: '@nullptr'
   - mode_topic_name: "dualboard_chassis_mode"
   - cmd: '@nullptr'
+  - sentry_buy_bullet_num_topic_name: "sentry_buy_bullet_num"
+  - sentry_remote_buy_bullet_times_topic_name: "sentry_remote_buy_bullet_times"
+  - sentry_remote_buy_hp_times_topic_name: "sentry_remote_buy_hp_times"
+  - sentry_buy_resurrection_topic_name: "sentry_buy_resurrection"
+  - sentry_state_topic_name: "sentry_state"
 template_args:
   - ROLE: DualBoardRole::GIMBAL
   - ChassisType: Omni
@@ -27,6 +32,7 @@ depends:
 // clang-format on
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -37,9 +43,11 @@ depends:
 #include "ChassisMotionState.hpp"
 #include "Referee.hpp"
 #include "RefereeCanCodec.hpp"
+#include "SentryDecisionFrame.hpp"
 #include "app_framework.hpp"
 #include "can.hpp"
 #include "libxr_def.hpp"
+#include "logger.hpp"
 #include "message.hpp"
 #include "mutex.hpp"
 #include "queue/mpmc_queue.hpp"
@@ -62,12 +70,21 @@ class DualBoard : public LibXR::Application {
  public:
   using ChassisMode = typename ChassisType::ChassisMode;
 
-  DualBoard(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-            const char* can_bus_name, uint32_t tx_id, uint32_t rx_id,
-            uint32_t rx_buffer_size, uint32_t tx_slot_count,
-            uint32_t offline_timeout_ms, Chassis<ChassisType>* chassis,
-            const char* mode_topic_name = "dualboard_chassis_mode",
-            CMD* cmd = nullptr)
+  DualBoard(
+      LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
+      const char* can_bus_name, uint32_t tx_id, uint32_t rx_id,
+      uint32_t rx_buffer_size, uint32_t tx_slot_count,
+      uint32_t offline_timeout_ms, Chassis<ChassisType>* chassis,
+      const char* mode_topic_name = "dualboard_chassis_mode",
+      CMD* cmd = nullptr,
+      const char* sentry_buy_bullet_num_topic_name = "sentry_buy_bullet_num",
+      const char* sentry_remote_buy_bullet_times_topic_name =
+          "sentry_remote_buy_bullet_times",
+      const char* sentry_remote_buy_hp_times_topic_name =
+          "sentry_remote_buy_hp_times",
+      const char* sentry_buy_resurrection_topic_name =
+          "sentry_buy_resurrection",
+      const char* sentry_state_topic_name = "sentry_state")
       : can_(hw.template FindOrExit<LibXR::CAN>({can_bus_name})),
         tx_id_(tx_id),
         rx_id_(rx_id),
@@ -77,6 +94,13 @@ class DualBoard : public LibXR::Application {
         chassis_(chassis),
         cmd_(cmd),
         mode_topic_name_(mode_topic_name),
+        sentry_buy_bullet_num_topic_name_(sentry_buy_bullet_num_topic_name),
+        sentry_remote_buy_bullet_times_topic_name_(
+            sentry_remote_buy_bullet_times_topic_name),
+        sentry_remote_buy_hp_times_topic_name_(
+            sentry_remote_buy_hp_times_topic_name),
+        sentry_buy_resurrection_topic_name_(sentry_buy_resurrection_topic_name),
+        sentry_state_topic_name_(sentry_state_topic_name),
         rx_frames_(rx_buffer_size) {
     ASSERT(rx_buffer_size_ > 0U);
     ASSERT(tx_slot_count_ > 0U);
@@ -168,6 +192,19 @@ class DualBoard : public LibXR::Application {
     uint16_t stage_remain_time;
   };
 
+  enum class DecisionUpdateKind : uint8_t {
+    BUY_BULLET,
+    REMOTE_BUY_BULLET,
+    REMOTE_BUY_HP,
+    BUY_RESURRECTION,
+    STATE,
+  };
+
+  struct DecisionUpdate {
+    DecisionUpdateKind kind;
+    uint16_t value;
+  };
+
   using RefereeAssembly = RefereeCanCodec::Assembly;
 
   static constexpr uint32_t CONTROL_PERIOD_MS = 10;
@@ -175,6 +212,7 @@ class DualBoard : public LibXR::Application {
   static constexpr uint32_t PROTOCOL_THREAD_PERIOD_MS = 2;
   static constexpr uint32_t CONTROL_ID_OFFSET = 0x00U;
   static constexpr uint32_t ANGLE_ID_OFFSET = 0x10U;
+  static constexpr uint16_t DECISION_ID_OFFSET = 0x1fU;
   static constexpr uint32_t ATTITUDE_ID_OFFSET = 0x20U;
   static constexpr uint32_t REFEREE_GAME_STATUS_ID_OFFSET =
       RefereeCanCodec::GAME_STATUS_ID_OFFSET;
@@ -199,6 +237,7 @@ class DualBoard : public LibXR::Application {
   static constexpr uint32_t REFEREE_LINK_STATUS_ID_OFFSET =
       RefereeCanCodec::LINK_STATUS_ID_OFFSET;
   static constexpr uint32_t REFEREE_STATUS_PERIOD_MS = 1000U;
+  static constexpr uint32_t DECISION_DROP_LOG_PERIOD_MS = 1000U;
   static constexpr uint32_t RX_ID_RANGE = ATTITUDE_ID_OFFSET;
   static constexpr float COMMAND_SCALE = 32767.0f;
   static constexpr float COMMAND_LIMIT = 1.0f;
@@ -297,6 +336,7 @@ class DualBoard : public LibXR::Application {
 
   void RegisterRoleTopics() {
     mode_topic_ = CreateTopic<uint32_t>(mode_topic_name_);
+    RegisterDecisionTopics();
 
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       RegisterTopicCallback<CMD::ChassisCMD, &DualBoard::OnLocalChassisCommand>(
@@ -308,15 +348,14 @@ class DualBoard : public LibXR::Application {
       RegisterTopicCallback<LibXR::EulerAngle<float>,
                             &DualBoard::OnLocalAttitude>("gimbal_euler");
 
-      chassis_motion_state_topic_ = LibXR::Topic(
-          LibXR::Topic::FindOrCreate<ChassisMotionState>(
+      chassis_motion_state_topic_ =
+          LibXR::Topic(LibXR::Topic::FindOrCreate<ChassisMotionState>(
               CHASSIS_MOTION_STATE_TOPIC_NAME, nullptr,
               CHASSIS_MOTION_STATE_TOPIC_MULTI_PUBLISHER));
 
       launcher_ref_topic_ = CreateTopic<Referee::LauncherPack>("launcher_ref");
       sentry_ref_topic_ =
           CreateTopic<Referee::RobotGameRefereePack>("sentry_ref");
-      sentry_state_topic_ = CreateTopic<uint8_t>("sentry_state");
     } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
       chassis_cmd_topic_ = CreateTopic<CMD::ChassisCMD>("chassis_cmd");
       yaw_angle_topic_ = CreateTopic<float>("yawmotor_angle");
@@ -330,6 +369,36 @@ class DualBoard : public LibXR::Application {
                             &DualBoard::OnLocalSentryRef>("sentry_ref");
       RegisterTopicCallback<Eigen::Matrix<float, 3, 1>,
                             &DualBoard::OnLocalChassisGyro>("chassis_gyro");
+    }
+  }
+
+  void RegisterDecisionTopics() {
+    sentry_buy_bullet_num_topic_ =
+        LibXR::Topic(LibXR::Topic::FindOrCreate<uint16_t>(
+            sentry_buy_bullet_num_topic_name_, nullptr, true));
+    sentry_remote_buy_bullet_times_topic_ =
+        LibXR::Topic(LibXR::Topic::FindOrCreate<uint8_t>(
+            sentry_remote_buy_bullet_times_topic_name_, nullptr, true));
+    sentry_remote_buy_hp_times_topic_ =
+        LibXR::Topic(LibXR::Topic::FindOrCreate<uint8_t>(
+            sentry_remote_buy_hp_times_topic_name_, nullptr, true));
+    sentry_buy_resurrection_topic_ =
+        LibXR::Topic(LibXR::Topic::FindOrCreate<bool>(
+            sentry_buy_resurrection_topic_name_, nullptr, true));
+    sentry_state_topic_ = LibXR::Topic(LibXR::Topic::FindOrCreate<uint8_t>(
+        sentry_state_topic_name_, nullptr, true));
+
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      RegisterTopicCallback<uint16_t, &DualBoard::OnSentryBuyBullet>(
+          sentry_buy_bullet_num_topic_name_);
+      RegisterTopicCallback<uint8_t, &DualBoard::OnSentryRemoteBuyBullet>(
+          sentry_remote_buy_bullet_times_topic_name_);
+      RegisterTopicCallback<uint8_t, &DualBoard::OnSentryRemoteBuyHp>(
+          sentry_remote_buy_hp_times_topic_name_);
+      RegisterTopicCallback<bool, &DualBoard::OnSentryBuyResurrection>(
+          sentry_buy_resurrection_topic_name_);
+      RegisterTopicCallback<uint8_t, &DualBoard::OnSentryState>(
+          sentry_state_topic_name_);
     }
   }
 
@@ -477,6 +546,54 @@ class DualBoard : public LibXR::Application {
     }
   }
 
+  void EnqueueDecisionUpdate(DecisionUpdateKind kind, uint16_t value) {
+    const DecisionUpdate update{kind, value};
+    if (decision_updates_.Push(update) != LibXR::ErrorCode::OK) {
+      decision_update_drops_.fetch_add(1U, std::memory_order_relaxed);
+    }
+  }
+
+  void OnSentryBuyBullet(const uint16_t& value) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      EnqueueDecisionUpdate(DecisionUpdateKind::BUY_BULLET, value);
+    } else {
+      UNUSED(value);
+    }
+  }
+
+  void OnSentryRemoteBuyBullet(const uint8_t& value) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      EnqueueDecisionUpdate(DecisionUpdateKind::REMOTE_BUY_BULLET, value);
+    } else {
+      UNUSED(value);
+    }
+  }
+
+  void OnSentryRemoteBuyHp(const uint8_t& value) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      EnqueueDecisionUpdate(DecisionUpdateKind::REMOTE_BUY_HP, value);
+    } else {
+      UNUSED(value);
+    }
+  }
+
+  void OnSentryBuyResurrection(const bool& value) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      EnqueueDecisionUpdate(DecisionUpdateKind::BUY_RESURRECTION,
+                            value ? 1U : 0U);
+    } else {
+      UNUSED(value);
+    }
+  }
+
+  void OnSentryState(const uint8_t& value) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      EnqueueDecisionUpdate(DecisionUpdateKind::STATE, value);
+    } else {
+      UNUSED(value);
+    }
+  }
+
   void OnLocalModeEvent(uint32_t event_id) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       if (!IsSupportedMode(event_id)) {
@@ -488,10 +605,9 @@ class DualBoard : public LibXR::Application {
       local_mode_valid_ = true;
       uint32_t mode = event_id;
       mode_topic_.Publish(mode);
-      motion_state_.mode =
-          event_id == static_cast<uint32_t>(ChassisMode::ROTOR)
-              ? ChassisMotionMode::ROTOR
-              : ChassisMotionMode::NON_ROTOR;
+      motion_state_.mode = event_id == static_cast<uint32_t>(ChassisMode::ROTOR)
+                               ? ChassisMotionMode::ROTOR
+                               : ChassisMotionMode::NON_ROTOR;
       PublishMotionStateLocked();
     } else {
       UNUSED(event_id);
@@ -530,6 +646,9 @@ class DualBoard : public LibXR::Application {
       auto now_ms = static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
 
       if constexpr (ROLE == DualBoardRole::GIMBAL) {
+        DrainDecisionUpdates();
+        SendDecisionFrameIfDue(now_ms);
+        ReportDecisionUpdateDrops(now_ms);
         SendGimbalControlFrames(now_ms);
         CheckOffline(now_ms);
       } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
@@ -541,6 +660,113 @@ class DualBoard : public LibXR::Application {
 
       protocol_thread_.SleepUntil(last_time, PROTOCOL_THREAD_PERIOD_MS);
     }
+  }
+
+  void DrainDecisionUpdates() {
+    if constexpr (ROLE != DualBoardRole::GIMBAL) {
+      return;
+    }
+
+    DecisionUpdate update{};
+    while (decision_updates_.Pop(update) == LibXR::ErrorCode::OK) {
+      switch (update.kind) {
+        case DecisionUpdateKind::BUY_BULLET: {
+          const uint32_t TOTAL =
+              pending_decision_.buy_bullet_delta + update.value;
+          pending_decision_.buy_bullet_delta =
+              static_cast<uint16_t>(std::min(TOTAL, 2047U));
+          pending_decision_.valid_mask |= SentryDecision::BUY_BULLET_VALID;
+          break;
+        }
+        case DecisionUpdateKind::REMOTE_BUY_BULLET: {
+          const uint8_t BULLET_COUNT = static_cast<uint8_t>(
+              std::min<uint16_t>(SentryDecision::RemoteBulletCount(
+                                     pending_decision_.remote_request_counts) +
+                                     update.value,
+                                 15U));
+          const uint8_t HP_COUNT = SentryDecision::RemoteHpCount(
+              pending_decision_.remote_request_counts);
+          pending_decision_.remote_request_counts =
+              SentryDecision::PackRemoteCounts(BULLET_COUNT, HP_COUNT);
+          pending_decision_.valid_mask |= SentryDecision::REMOTE_BULLET_VALID;
+          break;
+        }
+        case DecisionUpdateKind::REMOTE_BUY_HP: {
+          const uint8_t BULLET_COUNT = SentryDecision::RemoteBulletCount(
+              pending_decision_.remote_request_counts);
+          const uint8_t HP_COUNT = static_cast<uint8_t>(
+              std::min<uint16_t>(SentryDecision::RemoteHpCount(
+                                     pending_decision_.remote_request_counts) +
+                                     update.value,
+                                 15U));
+          pending_decision_.remote_request_counts =
+              SentryDecision::PackRemoteCounts(BULLET_COUNT, HP_COUNT);
+          pending_decision_.valid_mask |= SentryDecision::REMOTE_HP_VALID;
+          break;
+        }
+        case DecisionUpdateKind::BUY_RESURRECTION:
+          if (update.value != 0U) {
+            pending_decision_.flags |= SentryDecision::BUY_RESURRECTION_FLAG;
+          } else {
+            pending_decision_.flags &=
+                static_cast<uint8_t>(~SentryDecision::BUY_RESURRECTION_FLAG);
+          }
+          pending_decision_.valid_mask |=
+              SentryDecision::BUY_RESURRECTION_VALID;
+          break;
+        case DecisionUpdateKind::STATE:
+          pending_decision_.state = static_cast<uint8_t>(update.value);
+          pending_decision_.valid_mask |= SentryDecision::STATE_VALID;
+          break;
+      }
+    }
+  }
+
+  void SendDecisionFrameIfDue(uint32_t now_ms) {
+    if constexpr (ROLE != DualBoardRole::GIMBAL) {
+      UNUSED(now_ms);
+      return;
+    }
+
+    if (!decision_retry_.Active() && pending_decision_.valid_mask != 0U) {
+      active_decision_ = pending_decision_;
+      pending_decision_ = {};
+      pending_decision_.version = SentryDecision::VERSION;
+      active_decision_.sequence = ++decision_sequence_;
+      const bool STARTED = decision_retry_.Begin(
+          active_decision_, active_decision_.sequence, now_ms);
+      ASSERT(STARTED);
+    }
+
+    if (!decision_retry_.Due(now_ms)) {
+      return;
+    }
+
+    const bool SENT =
+        SendClassicFrame(tx_id_ + DECISION_ID_OFFSET, active_decision_);
+    decision_retry_.OnSendResult(SENT, now_ms);
+  }
+
+  void ReportDecisionUpdateDrops(uint32_t now_ms) {
+    if constexpr (ROLE != DualBoardRole::GIMBAL) {
+      UNUSED(now_ms);
+      return;
+    }
+
+    const uint32_t DROPS =
+        decision_update_drops_.load(std::memory_order_relaxed);
+    if (DROPS == reported_decision_update_drops_) {
+      return;
+    }
+    if (decision_drop_log_started_ &&
+        now_ms - last_decision_drop_log_ms_ < DECISION_DROP_LOG_PERIOD_MS) {
+      return;
+    }
+
+    XR_LOG_WARN("DualBoard decision update queue dropped {} items", DROPS);
+    reported_decision_update_drops_ = DROPS;
+    last_decision_drop_log_ms_ = now_ms;
+    decision_drop_log_started_ = true;
   }
 
   void SendMotionFrameIfDue(uint32_t now_ms) {
@@ -753,6 +979,8 @@ class DualBoard : public LibXR::Application {
         HandleControlFrame(pack);
       } else if (offset == ANGLE_ID_OFFSET) {
         HandleAngleFrame(pack);
+      } else if (offset == DECISION_ID_OFFSET) {
+        HandleDecisionFrame(pack);
       } else if (offset == ATTITUDE_ID_OFFSET) {
         HandleAttitudeFrame(pack);
       }
@@ -765,6 +993,55 @@ class DualBoard : public LibXR::Application {
       } else if (offset == ANGLE_ID_OFFSET) {
         HandleMotionFrame(pack);
       }
+    }
+  }
+
+  void HandleDecisionFrame(const LibXR::CAN::ClassicPack& pack) {
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      SentryDecisionFrame frame{};
+      std::memcpy(&frame, pack.data, sizeof(frame));
+      if (!SentryDecision::Validate(frame)) {
+        return;
+      }
+
+      const uint32_t now_ms =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+      last_decision_rx_time_ms_ = now_ms;
+      if (!decision_sequence_tracker_.Accept(frame.sequence, now_ms)) {
+        return;
+      }
+
+      if ((frame.valid_mask & SentryDecision::BUY_BULLET_VALID) != 0U) {
+        uint16_t value = frame.buy_bullet_delta;
+        sentry_buy_bullet_num_topic_.Publish(value);
+      }
+      if ((frame.valid_mask & SentryDecision::REMOTE_BULLET_VALID) != 0U) {
+        uint8_t event = 1U;
+        const uint8_t COUNT =
+            SentryDecision::RemoteBulletCount(frame.remote_request_counts);
+        for (uint8_t index = 0U; index < COUNT; ++index) {
+          sentry_remote_buy_bullet_times_topic_.Publish(event);
+        }
+      }
+      if ((frame.valid_mask & SentryDecision::REMOTE_HP_VALID) != 0U) {
+        uint8_t event = 1U;
+        const uint8_t COUNT =
+            SentryDecision::RemoteHpCount(frame.remote_request_counts);
+        for (uint8_t index = 0U; index < COUNT; ++index) {
+          sentry_remote_buy_hp_times_topic_.Publish(event);
+        }
+      }
+      if ((frame.valid_mask & SentryDecision::BUY_RESURRECTION_VALID) != 0U) {
+        bool value =
+            (frame.flags & SentryDecision::BUY_RESURRECTION_FLAG) != 0U;
+        sentry_buy_resurrection_topic_.Publish(value);
+      }
+      if ((frame.valid_mask & SentryDecision::STATE_VALID) != 0U) {
+        uint8_t value = frame.state;
+        sentry_state_topic_.Publish(value);
+      }
+    } else {
+      UNUSED(pack);
     }
   }
 
@@ -1135,6 +1412,11 @@ class DualBoard : public LibXR::Application {
   Chassis<ChassisType>* chassis_;
   CMD* cmd_;
   const char* mode_topic_name_;
+  const char* sentry_buy_bullet_num_topic_name_;
+  const char* sentry_remote_buy_bullet_times_topic_name_;
+  const char* sentry_remote_buy_hp_times_topic_name_;
+  const char* sentry_buy_resurrection_topic_name_;
+  const char* sentry_state_topic_name_;
 
   LibXR::Topic mode_topic_;
   LibXR::Topic chassis_cmd_topic_;
@@ -1143,12 +1425,18 @@ class DualBoard : public LibXR::Application {
   LibXR::Topic attitude_topic_;
   LibXR::Topic launcher_ref_topic_;
   LibXR::Topic sentry_ref_topic_;
+  LibXR::Topic sentry_buy_bullet_num_topic_;
+  LibXR::Topic sentry_remote_buy_bullet_times_topic_;
+  LibXR::Topic sentry_remote_buy_hp_times_topic_;
+  LibXR::Topic sentry_buy_resurrection_topic_;
   LibXR::Topic sentry_state_topic_;
   LibXR::Topic chassis_motion_state_topic_;
   LibXR::Event dual_board_event_;
   LibXR::CAN::Callback can_rx_callback_;
 
   LibXR::MPMCQueue<LibXR::CAN::ClassicPack> rx_frames_;
+  LibXR::MPMCQueue<DecisionUpdate> decision_updates_{32};
+  std::atomic<uint32_t> decision_update_drops_{0};
   LibXR::Semaphore rx_sem_;
   LibXR::Thread rx_thread_;
   LibXR::Thread protocol_thread_;
@@ -1173,15 +1461,25 @@ class DualBoard : public LibXR::Application {
   Eigen::Matrix<float, 3, 1> local_chassis_gyro_{};
   bool chassis_gyro_received_ = false;
   ChassisMotionState motion_state_{};
+  SentryDecisionFrame pending_decision_{
+      SentryDecision::VERSION, 0U, 0U, 0U, 0U, 0U, 0U};
+  SentryDecisionFrame active_decision_{};
+  SentryDecision::RetryController decision_retry_{};
+  SentryDecision::SequenceTracker decision_sequence_tracker_{};
 
   uint32_t next_control_tx_ms_ = 0;
   uint32_t next_launcher_feedback_tx_ms_ = 0;
   uint32_t next_referee_status_tx_ms_ = 0U;
   uint32_t last_rx_time_ms_ = 0;
+  uint32_t last_decision_rx_time_ms_ = 0U;
+  uint32_t last_decision_drop_log_ms_ = 0U;
+  uint32_t reported_decision_update_drops_ = 0U;
   uint8_t remote_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
   uint8_t tx_sequence_ = 0;
   uint8_t referee_sequences_[10]{};
   uint8_t referee_status_sequence_ = 0U;
+  uint8_t decision_sequence_ = 0U;
   bool online_ = false;
   bool safe_state_published_ = false;
+  bool decision_drop_log_started_ = false;
 };
