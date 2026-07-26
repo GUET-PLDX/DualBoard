@@ -18,6 +18,7 @@ constructor_args:
   - sentry_remote_buy_hp_times_topic_name: "sentry_remote_buy_hp_times"
   - sentry_buy_resurrection_topic_name: "sentry_buy_resurrection"
   - sentry_state_topic_name: "sentry_state"
+  - wheel_telemetry_topic_name: "chassis_wheel_telemetry"
 template_args:
   - ROLE: DualBoardRole::GIMBAL
   - ChassisType: Omni
@@ -42,6 +43,7 @@ depends:
 #include "CMD.hpp"
 #include "Chassis.hpp"
 #include "ChassisMotionState.hpp"
+#include "ChassisWheelTelemetry.hpp"
 #include "Referee.hpp"
 #include "RefereeCanCodec.hpp"
 #include "SentryDecisionFrame.hpp"
@@ -85,7 +87,8 @@ class DualBoard : public LibXR::Application {
           "sentry_remote_buy_hp_times",
       const char* sentry_buy_resurrection_topic_name =
           "sentry_buy_resurrection",
-      const char* sentry_state_topic_name = "sentry_state")
+      const char* sentry_state_topic_name = "sentry_state",
+      const char* wheel_telemetry_topic_name = "chassis_wheel_telemetry")
       : can_(hw.template FindOrExit<LibXR::CAN>({can_bus_name})),
         tx_id_(tx_id),
         rx_id_(rx_id),
@@ -102,6 +105,7 @@ class DualBoard : public LibXR::Application {
             sentry_remote_buy_hp_times_topic_name),
         sentry_buy_resurrection_topic_name_(sentry_buy_resurrection_topic_name),
         sentry_state_topic_name_(sentry_state_topic_name),
+        wheel_telemetry_topic_name_(wheel_telemetry_topic_name),
         rx_frames_(rx_buffer_size) {
     ASSERT(rx_buffer_size_ > 0U);
     ASSERT(tx_slot_count_ > 0U);
@@ -193,6 +197,39 @@ class DualBoard : public LibXR::Application {
     uint16_t stage_remain_time;
   };
 
+  struct __attribute__((packed)) WheelTelemetryMetaFrame {
+    uint8_t version;
+    uint16_t sequence;
+    uint32_t sample_time_us;
+    uint8_t global_status;
+  };
+
+  struct __attribute__((packed)) WheelTelemetryPairFrame {
+    uint16_t sequence;
+    int16_t first_wheel_q;
+    int16_t second_wheel_q;
+    uint8_t first_status;
+    uint8_t second_status;
+  };
+
+  struct __attribute__((packed)) WheelTelemetryDiagnosticFrame {
+    uint16_t sequence;
+    int16_t vx_mm_s;
+    int16_t vy_mm_s;
+    int16_t wz_mrad_s;
+  };
+
+  struct WheelTelemetryAssembly {
+    WheelTelemetryMetaFrame meta{};
+    WheelTelemetryPairFrame pair01{};
+    WheelTelemetryDiagnosticFrame diagnostic{};
+    WheelTelemetryPairFrame pair23{};
+    uint32_t started_ms = 0U;
+    uint16_t sequence = 0U;
+    uint8_t received_mask = 0U;
+    bool active = false;
+  };
+
   enum class DecisionUpdateKind : uint8_t {
     BUY_BULLET,
     REMOTE_BUY_BULLET,
@@ -238,6 +275,23 @@ class DualBoard : public LibXR::Application {
   static constexpr uint32_t REFEREE_LINK_STATUS_ID_OFFSET =
       RefereeCanCodec::LINK_STATUS_ID_OFFSET;
   static constexpr uint32_t REFEREE_STATUS_PERIOD_MS = 1000U;
+  static constexpr uint8_t WHEEL_TELEMETRY_VERSION = 1U;
+  static constexpr uint32_t WHEEL_TELEMETRY_META_ID_OFFSET = 0x17U;
+  static constexpr uint32_t WHEEL_TELEMETRY_PAIR01_ID_OFFSET = 0x18U;
+  static constexpr uint32_t WHEEL_TELEMETRY_DIAGNOSTIC_ID_OFFSET = 0x19U;
+  static constexpr uint32_t WHEEL_TELEMETRY_PAIR23_ID_OFFSET = 0x1AU;
+  static constexpr uint8_t WHEEL_META_RECEIVED = 1U << 0;
+  static constexpr uint8_t WHEEL_PAIR01_RECEIVED = 1U << 1;
+  static constexpr uint8_t WHEEL_DIAGNOSTIC_RECEIVED = 1U << 2;
+  static constexpr uint8_t WHEEL_PAIR23_RECEIVED = 1U << 3;
+  static constexpr uint8_t WHEEL_REQUIRED_MASK =
+      WHEEL_META_RECEIVED | WHEEL_PAIR01_RECEIVED | WHEEL_PAIR23_RECEIVED;
+  static constexpr uint32_t WHEEL_ASSEMBLY_TIMEOUT_MS = 20U;
+  static constexpr uint32_t WHEEL_STREAM_TIMEOUT_MS = 50U;
+  static constexpr uint32_t WHEEL_STALE_HEARTBEAT_MS = 100U;
+  static constexpr float WHEEL_Q_SCALE = 256.0f;
+  static constexpr float DIAGNOSTIC_LINEAR_SCALE = 1000.0f;
+  static constexpr float DIAGNOSTIC_ANGULAR_SCALE = 1000.0f;
   static constexpr uint32_t DECISION_DROP_LOG_PERIOD_MS = 1000U;
   static constexpr size_t DECISION_UPDATE_QUEUE_CAPACITY = 32U;
   static constexpr uint32_t RX_ID_RANGE = ATTITUDE_ID_OFFSET;
@@ -262,6 +316,16 @@ class DualBoard : public LibXR::Application {
                 "RefereeFragmentFrame must be one classic CAN frame");
   static_assert(sizeof(RefereeLinkStatusFrame) == 8,
                 "RefereeLinkStatusFrame must be one classic CAN frame");
+  static_assert(sizeof(WheelTelemetryMetaFrame) == 8,
+                "wheel telemetry meta must be one classic CAN frame");
+  static_assert(sizeof(WheelTelemetryPairFrame) == 8,
+                "wheel telemetry pair must be one classic CAN frame");
+  static_assert(sizeof(WheelTelemetryDiagnosticFrame) == 8,
+                "wheel telemetry diagnostic must be one classic CAN frame");
+  static_assert(WHEEL_TELEMETRY_META_ID_OFFSET >
+                        RefereeCanCodec::LINK_STATUS_ID_OFFSET &&
+                    WHEEL_TELEMETRY_PAIR23_ID_OFFSET < DECISION_ID_OFFSET,
+                "wheel telemetry CAN IDs overlap existing fixed frames");
 
   static void RxThreadEntry(DualBoard* self) { self->RunRxThread(); }
 
@@ -358,6 +422,8 @@ class DualBoard : public LibXR::Application {
       launcher_ref_topic_ = CreateTopic<Referee::LauncherPack>("launcher_ref");
       sentry_ref_topic_ =
           CreateTopic<Referee::RobotGameRefereePack>("sentry_ref");
+      wheel_telemetry_topic_ =
+          CreateTopic<ChassisWheelTelemetry>(wheel_telemetry_topic_name_);
     } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
       chassis_cmd_topic_ = CreateTopic<CMD::ChassisCMD>("chassis_cmd");
       yaw_angle_topic_ = CreateTopic<float>("yawmotor_angle");
@@ -371,6 +437,9 @@ class DualBoard : public LibXR::Application {
                             &DualBoard::OnLocalSentryRef>("sentry_ref");
       RegisterTopicCallback<Eigen::Matrix<float, 3, 1>,
                             &DualBoard::OnLocalChassisGyro>("chassis_gyro");
+      RegisterTopicCallback<ChassisWheelTelemetry,
+                            &DualBoard::OnLocalWheelTelemetry>(
+          wheel_telemetry_topic_name_);
     }
   }
 
@@ -548,6 +617,16 @@ class DualBoard : public LibXR::Application {
     }
   }
 
+  void OnLocalWheelTelemetry(const ChassisWheelTelemetry& telemetry) {
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      local_wheel_telemetry_ = telemetry;
+      wheel_telemetry_pending_ = true;
+    } else {
+      UNUSED(telemetry);
+    }
+  }
+
   void EnqueueDecisionUpdate(DecisionUpdateKind kind, uint16_t value) {
     const DecisionUpdate update{kind, value};
     if (decision_updates_.Push(update) != LibXR::ErrorCode::OK) {
@@ -652,9 +731,12 @@ class DualBoard : public LibXR::Application {
         SendDecisionFrameIfDue(now_ms);
         ReportDecisionUpdateDrops(now_ms);
         SendGimbalControlFrames(now_ms);
+        ExpireWheelTelemetryAssembly(now_ms);
+        CheckWheelTelemetryWatchdog(now_ms);
         CheckOffline(now_ms);
       } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
         SendMotionFrameIfDue(now_ms);
+        SendWheelTelemetryIfPending();
         SendLauncherFeedbackFrameIfDue(now_ms);
         SendRefereeFramesIfDue(now_ms);
         CheckOffline(now_ms);
@@ -803,6 +885,97 @@ class DualBoard : public LibXR::Application {
     }
 
     SendClassicFrame(tx_id_ + ANGLE_ID_OFFSET, frame);
+  }
+
+  static int16_t EncodeWheelVelocity(float value, uint8_t& status) {
+    const float SCALED = value * WHEEL_Q_SCALE;
+    if (!std::isfinite(SCALED) ||
+        SCALED > static_cast<float>(std::numeric_limits<int16_t>::max())) {
+      status |= ChassisWheelTelemetry::ENCODING_SATURATED;
+      status &= static_cast<uint8_t>(~ChassisWheelTelemetry::FRESH);
+      return std::numeric_limits<int16_t>::max();
+    }
+    if (SCALED < static_cast<float>(std::numeric_limits<int16_t>::min())) {
+      status |= ChassisWheelTelemetry::ENCODING_SATURATED;
+      status &= static_cast<uint8_t>(~ChassisWheelTelemetry::FRESH);
+      return std::numeric_limits<int16_t>::min();
+    }
+    return static_cast<int16_t>(std::lround(SCALED));
+  }
+
+  static bool EncodeDiagnostic(float value, float scale, int16_t& output) {
+    const float SCALED = value * scale;
+    if (!std::isfinite(SCALED) ||
+        SCALED < static_cast<float>(std::numeric_limits<int16_t>::min()) ||
+        SCALED > static_cast<float>(std::numeric_limits<int16_t>::max())) {
+      output = 0;
+      return false;
+    }
+    output = static_cast<int16_t>(std::lround(SCALED));
+    return true;
+  }
+
+  void SendWheelTelemetryIfPending() {
+    if constexpr (ROLE != DualBoardRole::CHASSIS) {
+      return;
+    }
+
+    ChassisWheelTelemetry telemetry{};
+    {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      if (!wheel_telemetry_pending_) {
+        return;
+      }
+      telemetry = local_wheel_telemetry_;
+      wheel_telemetry_pending_ = false;
+    }
+
+    WheelTelemetryPairFrame pair01{};
+    WheelTelemetryPairFrame pair23{};
+    pair01.sequence = telemetry.sequence;
+    pair23.sequence = telemetry.sequence;
+    pair01.first_status = telemetry.wheel_status[0];
+    pair01.second_status = telemetry.wheel_status[1];
+    pair23.first_status = telemetry.wheel_status[2];
+    pair23.second_status = telemetry.wheel_status[3];
+    pair01.first_wheel_q = EncodeWheelVelocity(
+        telemetry.wheel_angular_velocity[0], pair01.first_status);
+    pair01.second_wheel_q = EncodeWheelVelocity(
+        telemetry.wheel_angular_velocity[1], pair01.second_status);
+    pair23.first_wheel_q = EncodeWheelVelocity(
+        telemetry.wheel_angular_velocity[2], pair23.first_status);
+    pair23.second_wheel_q = EncodeWheelVelocity(
+        telemetry.wheel_angular_velocity[3], pair23.second_status);
+
+    const bool SATURATED = ((pair01.first_status | pair01.second_status |
+                             pair23.first_status | pair23.second_status) &
+                            ChassisWheelTelemetry::ENCODING_SATURATED) != 0U;
+    if (SATURATED) {
+      telemetry.global_status |= ChassisWheelTelemetry::STALE;
+    }
+
+    WheelTelemetryMetaFrame meta{
+        WHEEL_TELEMETRY_VERSION, telemetry.sequence,
+        static_cast<uint32_t>(telemetry.sample_time_us & 0xFFFFFFFFU),
+        telemetry.global_status};
+    WheelTelemetryDiagnosticFrame diagnostic{};
+    diagnostic.sequence = telemetry.sequence;
+    const bool DIAGNOSTIC_VALID =
+        EncodeDiagnostic(telemetry.vx, DIAGNOSTIC_LINEAR_SCALE,
+                         diagnostic.vx_mm_s) &&
+        EncodeDiagnostic(telemetry.vy, DIAGNOSTIC_LINEAR_SCALE,
+                         diagnostic.vy_mm_s) &&
+        EncodeDiagnostic(telemetry.wz, DIAGNOSTIC_ANGULAR_SCALE,
+                         diagnostic.wz_mrad_s);
+    if (!DIAGNOSTIC_VALID) {
+      meta.global_status &=
+          static_cast<uint8_t>(~ChassisWheelTelemetry::DIAGNOSTIC_VALID);
+    }
+
+    SendClassicFrame(tx_id_ + WHEEL_TELEMETRY_META_ID_OFFSET, meta);
+    SendClassicFrame(tx_id_ + WHEEL_TELEMETRY_PAIR01_ID_OFFSET, pair01);
+    SendClassicFrame(tx_id_ + WHEEL_TELEMETRY_DIAGNOSTIC_ID_OFFSET, diagnostic);
+    SendClassicFrame(tx_id_ + WHEEL_TELEMETRY_PAIR23_ID_OFFSET, pair23);
   }
 
   void SendGimbalControlFrames(uint32_t now_ms) {
@@ -966,6 +1139,8 @@ class DualBoard : public LibXR::Application {
 
   template <typename Frame>
   bool SendClassicFrame(uint32_t id, const Frame& frame) {
+    static_assert(sizeof(Frame) == 8U,
+                  "DualBoard fixed frames must fill classic CAN payload");
     LibXR::CAN::ClassicPack pack{};
     pack.id = id;
     pack.type = LibXR::CAN::Type::STANDARD;
@@ -991,6 +1166,9 @@ class DualBoard : public LibXR::Application {
         HandleAttitudeFrame(pack);
       }
     } else if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      if (HandleWheelTelemetryFrame(offset, pack)) {
+        return;
+      }
       if (HandleRefereeFrame(offset, pack)) {
         return;
       }
@@ -999,6 +1177,200 @@ class DualBoard : public LibXR::Application {
       } else if (offset == ANGLE_ID_OFFSET) {
         HandleMotionFrame(pack);
       }
+    }
+  }
+
+  static bool IsNewerWheelSequence(uint16_t candidate, uint16_t reference) {
+    return static_cast<int16_t>(candidate - reference) > 0;
+  }
+
+  void ResetWheelAssembly(uint16_t sequence, uint32_t now_ms) {
+    wheel_assembly_ = {};
+    wheel_assembly_.active = true;
+    wheel_assembly_.sequence = sequence;
+    wheel_assembly_.started_ms = now_ms;
+  }
+
+  bool PrepareWheelFragment(uint16_t sequence, uint8_t mask, uint32_t now_ms) {
+    if (wheel_assembly_.active &&
+        now_ms - wheel_assembly_.started_ms > WHEEL_ASSEMBLY_TIMEOUT_MS) {
+      wheel_assembly_ = {};
+    }
+    if (wheel_completed_ && sequence == last_wheel_sequence_) {
+      return false;
+    }
+    if (!wheel_assembly_.active) {
+      ResetWheelAssembly(sequence, now_ms);
+    } else if (sequence != wheel_assembly_.sequence) {
+      if (!IsNewerWheelSequence(sequence, wheel_assembly_.sequence)) {
+        return false;
+      }
+      ResetWheelAssembly(sequence, now_ms);
+    }
+    if ((wheel_assembly_.received_mask & mask) != 0U) {
+      return false;
+    }
+    wheel_assembly_.received_mask |= mask;
+    return true;
+  }
+
+  bool HandleWheelTelemetryFrame(const uint32_t offset,
+                                 const LibXR::CAN::ClassicPack& pack) {
+    if constexpr (ROLE != DualBoardRole::GIMBAL) {
+      UNUSED(offset);
+      UNUSED(pack);
+      return false;
+    }
+    if (offset < WHEEL_TELEMETRY_META_ID_OFFSET ||
+        offset > WHEEL_TELEMETRY_PAIR23_ID_OFFSET) {
+      return false;
+    }
+
+    ChassisWheelTelemetry complete{};
+    bool publish = false;
+    const uint32_t NOW_MS =
+        static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+    {
+      LibXR::Mutex::LockGuard lock(wheel_mutex_);
+      if (offset == WHEEL_TELEMETRY_META_ID_OFFSET) {
+        WheelTelemetryMetaFrame frame{};
+        std::memcpy(&frame, pack.data, sizeof(frame));
+        if (frame.version != WHEEL_TELEMETRY_VERSION ||
+            !PrepareWheelFragment(frame.sequence, WHEEL_META_RECEIVED,
+                                  NOW_MS)) {
+          return true;
+        }
+        wheel_assembly_.meta = frame;
+      } else if (offset == WHEEL_TELEMETRY_PAIR01_ID_OFFSET) {
+        WheelTelemetryPairFrame frame{};
+        std::memcpy(&frame, pack.data, sizeof(frame));
+        if (!PrepareWheelFragment(frame.sequence, WHEEL_PAIR01_RECEIVED,
+                                  NOW_MS)) {
+          return true;
+        }
+        wheel_assembly_.pair01 = frame;
+      } else if (offset == WHEEL_TELEMETRY_DIAGNOSTIC_ID_OFFSET) {
+        WheelTelemetryDiagnosticFrame frame{};
+        std::memcpy(&frame, pack.data, sizeof(frame));
+        if (!PrepareWheelFragment(frame.sequence, WHEEL_DIAGNOSTIC_RECEIVED,
+                                  NOW_MS)) {
+          return true;
+        }
+        wheel_assembly_.diagnostic = frame;
+      } else {
+        WheelTelemetryPairFrame frame{};
+        std::memcpy(&frame, pack.data, sizeof(frame));
+        if (!PrepareWheelFragment(frame.sequence, WHEEL_PAIR23_RECEIVED,
+                                  NOW_MS)) {
+          return true;
+        }
+        wheel_assembly_.pair23 = frame;
+      }
+
+      if ((wheel_assembly_.received_mask & WHEEL_REQUIRED_MASK) ==
+          WHEEL_REQUIRED_MASK) {
+        complete.sample_time_us = wheel_assembly_.meta.sample_time_us;
+        complete.sequence = wheel_assembly_.sequence;
+        complete.wheel_angular_velocity[0] =
+            static_cast<float>(wheel_assembly_.pair01.first_wheel_q) /
+            WHEEL_Q_SCALE;
+        complete.wheel_angular_velocity[1] =
+            static_cast<float>(wheel_assembly_.pair01.second_wheel_q) /
+            WHEEL_Q_SCALE;
+        complete.wheel_angular_velocity[2] =
+            static_cast<float>(wheel_assembly_.pair23.first_wheel_q) /
+            WHEEL_Q_SCALE;
+        complete.wheel_angular_velocity[3] =
+            static_cast<float>(wheel_assembly_.pair23.second_wheel_q) /
+            WHEEL_Q_SCALE;
+        complete.wheel_status[0] = wheel_assembly_.pair01.first_status;
+        complete.wheel_status[1] = wheel_assembly_.pair01.second_status;
+        complete.wheel_status[2] = wheel_assembly_.pair23.first_status;
+        complete.wheel_status[3] = wheel_assembly_.pair23.second_status;
+        complete.global_status =
+            static_cast<uint8_t>((wheel_assembly_.meta.global_status |
+                                  ChassisWheelTelemetry::TRANSPORT_VALID) &
+                                 ~ChassisWheelTelemetry::TIME_SYNC_VALID);
+        if ((wheel_assembly_.received_mask & WHEEL_DIAGNOSTIC_RECEIVED) != 0U) {
+          complete.vx = static_cast<float>(wheel_assembly_.diagnostic.vx_mm_s) /
+                        DIAGNOSTIC_LINEAR_SCALE;
+          complete.vy = static_cast<float>(wheel_assembly_.diagnostic.vy_mm_s) /
+                        DIAGNOSTIC_LINEAR_SCALE;
+          complete.wz =
+              static_cast<float>(wheel_assembly_.diagnostic.wz_mrad_s) /
+              DIAGNOSTIC_ANGULAR_SCALE;
+        } else {
+          complete.global_status &=
+              static_cast<uint8_t>(~ChassisWheelTelemetry::DIAGNOSTIC_VALID);
+        }
+        last_wheel_telemetry_ = complete;
+        last_wheel_sequence_ = complete.sequence;
+        last_wheel_rx_ms_ = NOW_MS;
+        wheel_stream_received_ = true;
+        wheel_stream_stale_ = false;
+        wheel_completed_ = true;
+        wheel_assembly_ = {};
+        publish = true;
+      }
+    }
+    if (publish) {
+      wheel_telemetry_topic_.Publish(complete);
+    }
+    return true;
+  }
+
+  void ExpireWheelTelemetryAssembly(uint32_t now_ms) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      LibXR::Mutex::LockGuard lock(wheel_mutex_);
+      if (wheel_assembly_.active &&
+          now_ms - wheel_assembly_.started_ms > WHEEL_ASSEMBLY_TIMEOUT_MS) {
+        wheel_assembly_ = {};
+      }
+    } else {
+      UNUSED(now_ms);
+    }
+  }
+
+  static ChassisWheelTelemetry MakeInvalidWheelTelemetry(
+      ChassisWheelTelemetry sample) {
+    sample.global_status &=
+        static_cast<uint8_t>(~(ChassisWheelTelemetry::TRANSPORT_VALID |
+                               ChassisWheelTelemetry::TIME_SYNC_VALID |
+                               ChassisWheelTelemetry::DIAGNOSTIC_VALID));
+    sample.global_status |= ChassisWheelTelemetry::STALE;
+    sample.vx = 0.0f;
+    sample.vy = 0.0f;
+    sample.wz = 0.0f;
+    for (auto& status : sample.wheel_status) {
+      status &= static_cast<uint8_t>(~ChassisWheelTelemetry::FRESH);
+    }
+    return sample;
+  }
+
+  void CheckWheelTelemetryWatchdog(uint32_t now_ms) {
+    if constexpr (ROLE != DualBoardRole::GIMBAL) {
+      UNUSED(now_ms);
+      return;
+    }
+    ChassisWheelTelemetry invalid{};
+    bool publish = false;
+    {
+      LibXR::Mutex::LockGuard lock(wheel_mutex_);
+      const uint32_t REFERENCE_MS =
+          wheel_stream_received_ ? last_wheel_rx_ms_ : wheel_watchdog_start_ms_;
+      if (now_ms - REFERENCE_MS <= WHEEL_STREAM_TIMEOUT_MS) {
+        return;
+      }
+      if (!wheel_stream_stale_ ||
+          now_ms - last_wheel_stale_publish_ms_ >= WHEEL_STALE_HEARTBEAT_MS) {
+        invalid = MakeInvalidWheelTelemetry(last_wheel_telemetry_);
+        wheel_stream_stale_ = true;
+        last_wheel_stale_publish_ms_ = now_ms;
+        publish = true;
+      }
+    }
+    if (publish) {
+      wheel_telemetry_topic_.Publish(invalid);
     }
   }
 
@@ -1423,6 +1795,7 @@ class DualBoard : public LibXR::Application {
   const char* sentry_remote_buy_hp_times_topic_name_;
   const char* sentry_buy_resurrection_topic_name_;
   const char* sentry_state_topic_name_;
+  const char* wheel_telemetry_topic_name_;
 
   LibXR::Topic mode_topic_;
   LibXR::Topic chassis_cmd_topic_;
@@ -1437,6 +1810,7 @@ class DualBoard : public LibXR::Application {
   LibXR::Topic sentry_buy_resurrection_topic_;
   LibXR::Topic sentry_state_topic_;
   LibXR::Topic chassis_motion_state_topic_;
+  LibXR::Topic wheel_telemetry_topic_;
   LibXR::Event dual_board_event_;
   LibXR::CAN::Callback can_rx_callback_;
 
@@ -1448,6 +1822,7 @@ class DualBoard : public LibXR::Application {
   LibXR::Thread rx_thread_;
   LibXR::Thread protocol_thread_;
   LibXR::Mutex data_mutex_;
+  LibXR::Mutex wheel_mutex_;
 
   CMD::ChassisCMD local_chassis_command_{};
   float local_yaw_angle_ = 0.0f;
@@ -1467,6 +1842,9 @@ class DualBoard : public LibXR::Application {
   bool launcher_feedback_valid_ = false;
   Eigen::Matrix<float, 3, 1> local_chassis_gyro_{};
   bool chassis_gyro_received_ = false;
+  ChassisWheelTelemetry local_wheel_telemetry_{};
+  ChassisWheelTelemetry last_wheel_telemetry_{};
+  WheelTelemetryAssembly wheel_assembly_{};
   ChassisMotionState motion_state_{};
   SentryDecisionFrame pending_decision_{
       SentryDecision::VERSION, 0U, 0U, 0U, 0U, 0U, 0U};
@@ -1477,6 +1855,10 @@ class DualBoard : public LibXR::Application {
   uint32_t next_control_tx_ms_ = 0;
   uint32_t next_launcher_feedback_tx_ms_ = 0;
   uint32_t next_referee_status_tx_ms_ = 0U;
+  uint32_t wheel_watchdog_start_ms_ =
+      static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+  uint32_t last_wheel_rx_ms_ = 0U;
+  uint32_t last_wheel_stale_publish_ms_ = 0U;
   uint32_t last_rx_time_ms_ = 0;
   uint32_t last_decision_rx_time_ms_ = 0U;
   uint32_t last_decision_drop_log_ms_ = 0U;
@@ -1486,7 +1868,12 @@ class DualBoard : public LibXR::Application {
   uint8_t referee_sequences_[10]{};
   uint8_t referee_status_sequence_ = 0U;
   uint8_t decision_sequence_ = 0U;
+  uint16_t last_wheel_sequence_ = 0U;
   bool online_ = false;
   bool safe_state_published_ = false;
   bool decision_drop_log_started_ = false;
+  bool wheel_telemetry_pending_ = false;
+  bool wheel_completed_ = false;
+  bool wheel_stream_received_ = false;
+  bool wheel_stream_stale_ = false;
 };

@@ -47,9 +47,26 @@
 | `0x324` | 伤害状态 |
 | `0x325-0x326` | 本机位置 |
 | `0x327` | 裁判链路与源有效位 |
+| `0x328` | 轮速遥测版本、序列、底盘采样时间低 32 位、全局状态 |
+| `0x329` | 轮 0/1 的 Q8.8 rad/s 与轮状态 |
+| `0x32A` | 可选底盘诊断 `vx/vy` mm/s、`wz` mrad/s |
+| `0x32B` | 轮 2/3 的 Q8.8 rad/s 与轮状态 |
 
 多帧业务每帧携带 1 字节序号和 7 字节数据。重组器在全部分片到齐后才发布，
 混合序号会重置，20 ms 未完成会过期，重复完成帧不会重复发布。
+
+轮速遥测保持 Omni 几何顺序（0: `0x204`，1: `0x201`，2: 反向
+`0x202`，3: `0x203`），不按 CAN ID 排序。meta、pair01、pair23 同序列
+到齐后才发布 `chassis_wheel_telemetry`；diagnostic 可缺失。Q8.8 饱和会设置
+`ENCODING_SATURATED` 并清对应轮 `FRESH`。云台侧使用独立 50 ms stream
+watchdog，首次超时立即发布 invalid，持续超时时每 100 ms 发布一次 invalid
+heartbeat；该状态不修改 DualBoard 通用 `online_`。
+
+新增链路固定为每个 100 Hz semantic sample 发送 4 帧，即约 400 frame/s。
+标准 11-bit Classic CAN、8-byte payload 每帧名义约 111 bit，按最坏位填充及
+帧间隔估算约 130 bit，增量线负载约 52 kbit/s：1 Mbit/s 总线约 5.2%，
+500 kbit/s 总线约 10.4%。这是静态预算；真实 arbitration、错误重发和总线利用率
+必须在硬件门禁中测量，不能由该估算替代。
 
 ## 构造参数
 
@@ -74,6 +91,7 @@
     sentry_remote_buy_hp_times_topic_name: sentry_remote_buy_hp_times
     sentry_buy_resurrection_topic_name: sentry_buy_resurrection
     sentry_state_topic_name: sentry_state
+    wheel_telemetry_topic_name: chassis_wheel_telemetry
 ```
 
 底盘板需要把 `ROLE` 改为 `DualBoardRole::CHASSIS`，CAN ID 对调，并传入 `chassis: '@&chassis'`。
@@ -99,6 +117,8 @@ Chassis -> Gimbal：
 - `chassis_gyro`，类型 `Eigen::Matrix<float, 3, 1>`，底盘侧 BMI088 输入
 - `chassis_gyro_z`，类型 `float`，云台侧单发布者 Topic；无效帧或完整链路失联时发布零
 - `sentry_ref`，类型 `Referee::RobotGameRefereePack`，底盘侧为 CAN2 输入，云台侧为完整重组后的本地输出
+- `chassis_wheel_telemetry`，类型 `ChassisWheelTelemetry`，底盘侧为 100 Hz
+  semantic 输入，云台侧为固定 CAN 帧完整重组后的输出
 
 云台五个 decision source Topic 的回调只把 `DecisionUpdate` 放入 32 深度
 `MPMCQueue`；协议线程聚合 pending frame（购弹增量饱和到 `2047`，远程次数饱和到
