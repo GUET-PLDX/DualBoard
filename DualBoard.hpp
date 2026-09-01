@@ -1300,6 +1300,11 @@ class DualBoard : public LibXR::Application {
     LibXR::Memory::FastCopy(&frame, pack.data, sizeof(Frame));
   }
 
+  template <typename Data>
+  static void PublishValue(LibXR::Topic& topic, Data value) {
+    topic.Publish(value);
+  }
+
   void HandleCanFrame(const LibXR::CAN::ClassicPack& pack) {
     if (pack.type != LibXR::CAN::Type::STANDARD || pack.dlc != 8U) {
       return;
@@ -1747,8 +1752,8 @@ class DualBoard : public LibXR::Application {
       const uint32_t now_ms =
           static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
       const bool accepted = valid && std::isfinite(yaw);
-      chassis_imu_yaw_topic_.Publish(accepted ? yaw : 0.0F);
-      chassis_imu_yaw_valid_topic_.Publish(accepted);
+      PublishValue(chassis_imu_yaw_topic_, accepted ? yaw : 0.0F);
+      PublishValue(chassis_imu_yaw_valid_topic_, accepted);
       last_chassis_yaw_rx_ms_ = now_ms;
       chassis_yaw_stale_ = !accepted;
     } else {
@@ -1768,8 +1773,8 @@ class DualBoard : public LibXR::Application {
     if (chassis_yaw_stale_) {
       return;
     }
-    chassis_imu_yaw_topic_.Publish(0.0F);
-    chassis_imu_yaw_valid_topic_.Publish(false);
+    PublishValue(chassis_imu_yaw_topic_, 0.0F);
+    PublishValue(chassis_imu_yaw_valid_topic_, false);
     chassis_yaw_stale_ = true;
   }
 
@@ -1780,9 +1785,9 @@ class DualBoard : public LibXR::Application {
       const bool VALID = frame.valid == 1U && frame.capacity_percent <= 100U;
       const uint32_t NOW_MS =
           static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-      chassis_capacitor_capacity_topic_.Publish(VALID ? frame.capacity_percent
-                                                      : 255U);
-      chassis_capacitor_valid_topic_.Publish(VALID);
+      PublishValue<uint8_t>(chassis_capacitor_capacity_topic_,
+                            VALID ? frame.capacity_percent : 255U);
+      PublishValue(chassis_capacitor_valid_topic_, VALID);
       last_capacitor_rx_ms_ = NOW_MS;
       capacitor_stale_ = !VALID;
     } else {
@@ -1802,8 +1807,8 @@ class DualBoard : public LibXR::Application {
     if (capacitor_stale_) {
       return;
     }
-    chassis_capacitor_capacity_topic_.Publish(255U);
-    chassis_capacitor_valid_topic_.Publish(false);
+    PublishValue<uint8_t>(chassis_capacitor_capacity_topic_, 255U);
+    PublishValue(chassis_capacitor_valid_topic_, false);
     capacitor_stale_ = true;
   }
 
@@ -2147,6 +2152,7 @@ class DualBoard : public LibXR::Application {
   SentryDecision::SequenceTracker decision_sequence_tracker_{};
 
   uint32_t next_control_tx_ms_ = 0;
+  uint32_t next_chassis_yaw_tx_ms_ = 0U;
   uint32_t next_capacitor_tx_ms_ = 0U;
   uint32_t next_launcher_feedback_tx_ms_ = 0;
   uint32_t next_referee_status_tx_ms_ = 0U;
@@ -2164,6 +2170,7 @@ class DualBoard : public LibXR::Application {
   uint8_t remote_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
   uint8_t tx_sequence_ = 0;
   uint8_t force_sequence_ = 0U;
+  uint8_t chassis_yaw_sequence_ = 0U;
   uint8_t capacitor_sequence_ = 0U;
   uint8_t referee_sequences_[11]{};
   uint8_t referee_status_sequence_ = 0U;

@@ -20,7 +20,7 @@ required = (
     "sizeof(ChassisYawFrame) == 8",
     "SendChassisYawFrameIfDue(now_ms);",
     "HandleChassisYawFrame(pack);",
-    "chassis_imu_yaw_valid_topic_.Publish(false)",
+    "PublishValue(chassis_imu_yaw_valid_topic_, false)",
     "local_chassis_yaw_time_ms_",
     "now_ms - chassis_yaw_time_ms <=",
     "const bool accepted = valid && std::isfinite(yaw);",
