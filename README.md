@@ -51,6 +51,7 @@
 | `0x329` | 轮 0/1 的 Q8.8 rad/s 与轮状态 |
 | `0x32A` | 可选底盘诊断 `vx/vy` mm/s、`wz` mrad/s |
 | `0x32B` | 轮 2/3 的 Q8.8 rad/s 与轮状态 |
+| `0x330` | 底盘 AHRS yaw：`int16 yaw_q`、`uint8 valid`、`uint8 sequence`、`uint32 sample_time_ms` |
 
 多帧业务每帧携带 1 字节序号和 7 字节数据。重组器在全部分片到齐后才发布，
 混合序号会重置，20 ms 未完成会过期，重复完成帧不会重复发布。

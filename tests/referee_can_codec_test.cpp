@@ -9,6 +9,7 @@ namespace {
 
 using Codec = RefereeCanCodec;
 using Bytes20 = std::array<uint8_t, 20U>;
+using Bytes40 = std::array<uint8_t, 40U>;
 
 Bytes20 MakePayload() {
   Bytes20 payload{};
@@ -85,15 +86,36 @@ void LinkStatusCannotValidateMissingLocalGroups() {
                 0U);
 }
 
+void ReassemblesFortyBytePositionPayload() {
+  Bytes40 payload{};
+  for (size_t index = 0U; index < payload.size(); ++index) {
+    payload[index] = static_cast<uint8_t>(index + 3U);
+  }
+  const auto frames = Codec::Encode(4U, payload);
+  assert(frames.size() == 6U);
+  Codec::Assembly assembly{};
+  Bytes40 output{};
+  for (size_t index : {3U, 0U, 5U, 1U, 4U, 2U}) {
+    assert(Codec::Push(assembly, index, frames[index], 200U + index, output) ==
+           (index == 2U ? Codec::PushResult::COMPLETE
+                        : Codec::PushResult::INCOMPLETE));
+  }
+  assert(output == payload);
+  assert(Codec::Push(assembly, 2U, frames[2], 210U, output) ==
+         Codec::PushResult::DUPLICATE);
+}
+
 }  // namespace
 
 int main() {
   static_assert(Codec::GAME_STATUS_ID_OFFSET == 0x02U);
   static_assert(Codec::ROBOT_HP_ID_OFFSET == 0x04U);
-  static_assert(Codec::LINK_STATUS_ID_OFFSET == 0x16U);
+  static_assert(Codec::ROBOT_POS_ID_OFFSET == 0x14U);
+  static_assert(Codec::LINK_STATUS_ID_OFFSET == 0x1EU);
   ReassemblesOnlyAfterAllFragments();
   RejectsMixedSequences();
   IgnoresDuplicateCompletion();
   ExpiresIncompleteGroupAfterTwentyMilliseconds();
   LinkStatusCannotValidateMissingLocalGroups();
+  ReassemblesFortyBytePositionPayload();
 }

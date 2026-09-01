@@ -4,8 +4,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <type_traits>
+
+#include "libxr_mem.hpp"
 
 class RefereeCanCodec {
  public:
@@ -18,11 +19,14 @@ class RefereeCanCodec {
   static constexpr uint32_t BULLET_REMAIN_ID_OFFSET = 0x0EU;
   static constexpr uint32_t RFID_ID_OFFSET = 0x12U;
   static constexpr uint32_t ROBOT_DAMAGE_ID_OFFSET = 0x13U;
+  // Position payload uses six dedicated classic-CAN frames (40 bytes).
   static constexpr uint32_t ROBOT_POS_ID_OFFSET = 0x14U;
-  static constexpr uint32_t LINK_STATUS_ID_OFFSET = 0x16U;
+  static constexpr uint32_t LINK_STATUS_ID_OFFSET = 0x1EU;
   static constexpr uint32_t REASSEMBLY_TIMEOUT_MS = 20U;
   static constexpr size_t FRAGMENT_DATA_SIZE = 7U;
-  static constexpr size_t MAX_DATA_SIZE = 21U;
+  // RobotPosForSentry is ten IEEE-754 floats (40 bytes); leave room for the
+  // complete payload while retaining the seven-byte data area per CAN frame.
+  static constexpr size_t MAX_DATA_SIZE = 42U;
 
   struct __attribute__((packed)) FragmentFrame {
     uint8_t sequence = 0U;
@@ -59,7 +63,8 @@ class RefereeCanCodec {
       const size_t byte_offset = index * FRAGMENT_DATA_SIZE;
       const size_t byte_count = std::min(
           FRAGMENT_DATA_SIZE, static_cast<size_t>(sizeof(Data) - byte_offset));
-      std::memcpy(frames[index].data, bytes + byte_offset, byte_count);
+      LibXR::Memory::FastCopy(frames[index].data, bytes + byte_offset,
+                              byte_count);
     }
     return frames;
   }
@@ -83,12 +88,13 @@ class RefereeCanCodec {
       assembly.active = true;
       assembly.sequence = frame.sequence;
     }
-    assembly.last_update_ms = now_ms;
+    if (now_ms >= assembly.last_update_ms) assembly.last_update_ms = now_ms;
 
     const size_t byte_offset = fragment_index * FRAGMENT_DATA_SIZE;
     const size_t byte_count = std::min(
         FRAGMENT_DATA_SIZE, static_cast<size_t>(sizeof(Data) - byte_offset));
-    std::memcpy(assembly.data + byte_offset, frame.data, byte_count);
+    LibXR::Memory::FastCopy(assembly.data + byte_offset, frame.data,
+                            byte_count);
     assembly.received_mask |= static_cast<uint8_t>(1U << fragment_index);
     constexpr uint8_t EXPECTED_MASK =
         static_cast<uint8_t>((1U << FRAGMENT_COUNT) - 1U);
@@ -100,14 +106,14 @@ class RefereeCanCodec {
       return PushResult::DUPLICATE;
     }
 
-    std::memcpy(&output, assembly.data, sizeof(Data));
+    LibXR::Memory::FastCopy(&output, assembly.data, sizeof(Data));
     assembly.has_published = true;
     assembly.published_sequence = frame.sequence;
     return PushResult::COMPLETE;
   }
 
   static bool Expire(Assembly& assembly, uint32_t now_ms) {
-    if (!assembly.active ||
+    if (!assembly.active || now_ms < assembly.last_update_ms ||
         now_ms - assembly.last_update_ms <= REASSEMBLY_TIMEOUT_MS) {
       return false;
     }

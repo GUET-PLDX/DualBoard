@@ -11,10 +11,10 @@ import sys
 
 source = Path(sys.argv[1]).read_text()
 required = {
-    "meta ID": "WHEEL_TELEMETRY_META_ID_OFFSET = 0x17U",
-    "pair01 ID": "WHEEL_TELEMETRY_PAIR01_ID_OFFSET = 0x18U",
-    "diagnostic ID": "WHEEL_TELEMETRY_DIAGNOSTIC_ID_OFFSET = 0x19U",
-    "pair23 ID": "WHEEL_TELEMETRY_PAIR23_ID_OFFSET = 0x1AU",
+    "meta ID": "WHEEL_TELEMETRY_META_ID_OFFSET = 0x1AU",
+    "pair01 ID": "WHEEL_TELEMETRY_PAIR01_ID_OFFSET = 0x1BU",
+    "diagnostic ID": "WHEEL_TELEMETRY_DIAGNOSTIC_ID_OFFSET = 0x1CU",
+    "pair23 ID": "WHEEL_TELEMETRY_PAIR23_ID_OFFSET = 0x1DU",
     "20 ms assembly timeout": "WHEEL_ASSEMBLY_TIMEOUT_MS = 20U",
     "50 ms stream timeout": "WHEEL_STREAM_TIMEOUT_MS = 50U",
     "10 Hz heartbeat": "WHEEL_STALE_HEARTBEAT_MS = 100U",
@@ -51,9 +51,9 @@ wheel_rx = source[wheel_rx_start:wheel_rx_end]
 if re.search(r"\b(?:online_|last_rx_time_ms_)\s*=", wheel_rx):
     raise SystemExit("wheel stream must not broaden general DualBoard online state")
 
-mutant = source.replace("WHEEL_TELEMETRY_PAIR23_ID_OFFSET = 0x1AU",
+mutant = source.replace("WHEEL_TELEMETRY_PAIR23_ID_OFFSET = 0x1DU",
                         "WHEEL_TELEMETRY_PAIR23_ID_OFFSET = 0x1FU")
-collision_guard = source[source.index("static_assert(WHEEL_TELEMETRY_META_ID_OFFSET"):
+collision_guard = source[source.index("static_assert(RefereeCanCodec::ROBOT_POS_ID_OFFSET"):
                          source.index("static void RxThreadEntry")]
 if "DECISION_ID_OFFSET" not in collision_guard or mutant == source:
     raise SystemExit("CAN ID collision mutation guard missing")

@@ -105,8 +105,11 @@ need_in "$dispatch_body" 'offset == ANGLE_ID_OFFSET' \
 need_in "$dispatch_body" 'HandleMotionFrame\(pack\)' \
   'gimbal dispatch invokes MotionFrame decoding'
 
-need_in "$motion_body" 'std::memcpy\(&frame, pack\.data, sizeof\(frame\)\)' \
+need_in "$motion_body" 'LoadClassicFrame\(pack, frame\)' \
   'MotionFrame is decoded from the classic CAN payload'
+load_body="$(extract_body LoadClassicFrame)"
+need_in "$load_body" 'LibXR::Memory::FastCopy\(&frame, pack\.data, sizeof\(Frame\)\)' \
+  'classic CAN payload decode uses LibXR Memory::FastCopy'
 need_in "$motion_body" 'frame\.gyro_valid == 1U' \
   'MotionFrame validity flag controls semantic validity'
 need_in "$motion_body" 'DecodeSigned\(frame\.gyro_z_q, GYRO_SCALE\)' \

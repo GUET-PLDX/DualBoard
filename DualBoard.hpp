@@ -19,6 +19,8 @@ constructor_args:
   - sentry_buy_resurrection_topic_name: "sentry_buy_resurrection"
   - sentry_state_topic_name: "sentry_state"
   - wheel_telemetry_topic_name: "chassis_wheel_telemetry"
+  - chassis_euler_topic_name: "chassis_euler"
+  - power_control: '@nullptr'
 template_args:
   - ROLE: DualBoardRole::GIMBAL
   - ChassisType: Omni
@@ -28,6 +30,7 @@ required_hardware:
 depends:
   - pldx/CMD
   - pldx/Chassis
+  - pldx/PowerControl
   - pldx/Referee
 === END MANIFEST === */
 // clang-format on
@@ -37,19 +40,21 @@ depends:
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 
 #include "CMD.hpp"
 #include "Chassis.hpp"
 #include "ChassisMotionState.hpp"
 #include "ChassisWheelTelemetry.hpp"
+#include "DualBoardControlFrame.hpp"
+#include "PowerControl.hpp"
 #include "Referee.hpp"
 #include "RefereeCanCodec.hpp"
 #include "SentryDecisionFrame.hpp"
 #include "app_framework.hpp"
 #include "can.hpp"
 #include "libxr_def.hpp"
+#include "libxr_mem.hpp"
 #include "logger.hpp"
 #include "message.hpp"
 #include "mutex.hpp"
@@ -88,7 +93,9 @@ class DualBoard : public LibXR::Application {
       const char* sentry_buy_resurrection_topic_name =
           "sentry_buy_resurrection",
       const char* sentry_state_topic_name = "sentry_state",
-      const char* wheel_telemetry_topic_name = "chassis_wheel_telemetry")
+      const char* wheel_telemetry_topic_name = "chassis_wheel_telemetry",
+      const char* chassis_euler_topic_name = "chassis_euler",
+      PowerControl* power_control = nullptr)
       : can_(hw.template FindOrExit<LibXR::CAN>({can_bus_name})),
         tx_id_(tx_id),
         rx_id_(rx_id),
@@ -106,6 +113,8 @@ class DualBoard : public LibXR::Application {
         sentry_buy_resurrection_topic_name_(sentry_buy_resurrection_topic_name),
         sentry_state_topic_name_(sentry_state_topic_name),
         wheel_telemetry_topic_name_(wheel_telemetry_topic_name),
+        chassis_euler_topic_name_(chassis_euler_topic_name),
+        power_control_(power_control),
         rx_frames_(rx_buffer_size) {
     ASSERT(rx_buffer_size_ > 0U);
     ASSERT(tx_slot_count_ > 0U);
@@ -142,13 +151,8 @@ class DualBoard : public LibXR::Application {
   bool IsOnline() const { return online_; }
 
  private:
-  struct __attribute__((packed)) ControlFrame {
-    int16_t x;
-    int16_t y;
-    int16_t z;
-    int8_t self_define;
-    uint8_t mode;
-  };
+  using ControlFrame = Pldx::DualBoardControl::Frame;
+  using ForceFrame = Pldx::DualBoardControl::ForceFrame;
 
   struct __attribute__((packed)) AngleFrame {
     int16_t yaw;
@@ -163,6 +167,21 @@ class DualBoard : public LibXR::Application {
     int16_t gyro_z_q;
     uint8_t gyro_valid;
     uint8_t reserved[5];
+  };
+
+  struct __attribute__((packed)) ChassisYawFrame {
+    int16_t yaw_q;
+    uint8_t valid;
+    uint8_t sequence;
+    uint32_t sample_time_ms;
+  };
+
+  struct __attribute__((packed)) CapacitorFrame {
+    uint8_t capacity_percent;
+    uint8_t valid;
+    uint8_t sequence;
+    uint8_t reserved;
+    uint32_t sample_time_ms;
   };
 
   struct __attribute__((packed)) AttitudeFrame {
@@ -249,9 +268,16 @@ class DualBoard : public LibXR::Application {
   static constexpr uint32_t LAUNCHER_FEEDBACK_PERIOD_MS = 20;
   static constexpr uint32_t PROTOCOL_THREAD_PERIOD_MS = 2;
   static constexpr uint32_t CONTROL_ID_OFFSET = 0x00U;
+  static constexpr uint32_t FORCE_ID_OFFSET = 0x01U;
   static constexpr uint32_t ANGLE_ID_OFFSET = 0x10U;
   static constexpr uint16_t DECISION_ID_OFFSET = 0x1fU;
   static constexpr uint32_t ATTITUDE_ID_OFFSET = 0x20U;
+  // Bottom-board yaw is sent on 0x330 (chassis tx_id 0x311 + 0x1f).
+  static constexpr uint32_t CHASSIS_YAW_ID_OFFSET = 0x1FU;
+  static constexpr uint32_t CAPACITOR_ID_OFFSET = 0x1EU;
+  static constexpr uint32_t CHASSIS_YAW_TIMEOUT_MS = 100U;
+  static constexpr uint32_t CAPACITOR_TIMEOUT_MS = 150U;
+  static constexpr uint32_t FORCE_TIMEOUT_MS = 150U;
   static constexpr uint32_t REFEREE_GAME_STATUS_ID_OFFSET =
       RefereeCanCodec::GAME_STATUS_ID_OFFSET;
   static constexpr uint32_t REFEREE_FIELD_EVENT_ID_OFFSET =
@@ -276,10 +302,10 @@ class DualBoard : public LibXR::Application {
       RefereeCanCodec::LINK_STATUS_ID_OFFSET;
   static constexpr uint32_t REFEREE_STATUS_PERIOD_MS = 1000U;
   static constexpr uint8_t WHEEL_TELEMETRY_VERSION = 1U;
-  static constexpr uint32_t WHEEL_TELEMETRY_META_ID_OFFSET = 0x17U;
-  static constexpr uint32_t WHEEL_TELEMETRY_PAIR01_ID_OFFSET = 0x18U;
-  static constexpr uint32_t WHEEL_TELEMETRY_DIAGNOSTIC_ID_OFFSET = 0x19U;
-  static constexpr uint32_t WHEEL_TELEMETRY_PAIR23_ID_OFFSET = 0x1AU;
+  static constexpr uint32_t WHEEL_TELEMETRY_META_ID_OFFSET = 0x1AU;
+  static constexpr uint32_t WHEEL_TELEMETRY_PAIR01_ID_OFFSET = 0x1BU;
+  static constexpr uint32_t WHEEL_TELEMETRY_DIAGNOSTIC_ID_OFFSET = 0x1CU;
+  static constexpr uint32_t WHEEL_TELEMETRY_PAIR23_ID_OFFSET = 0x1DU;
   static constexpr uint8_t WHEEL_META_RECEIVED = 1U << 0;
   static constexpr uint8_t WHEEL_PAIR01_RECEIVED = 1U << 1;
   static constexpr uint8_t WHEEL_DIAGNOSTIC_RECEIVED = 1U << 2;
@@ -295,8 +321,6 @@ class DualBoard : public LibXR::Application {
   static constexpr uint32_t DECISION_DROP_LOG_PERIOD_MS = 1000U;
   static constexpr size_t DECISION_UPDATE_QUEUE_CAPACITY = 32U;
   static constexpr uint32_t RX_ID_RANGE = ATTITUDE_ID_OFFSET;
-  static constexpr float COMMAND_SCALE = 32767.0f;
-  static constexpr float COMMAND_LIMIT = 1.0f;
   static constexpr float ANGLE_SCALE = 10000.0f;
   static constexpr float ANGLE_LIMIT = 3.2f;
   static constexpr float GYRO_SCALE = 900.0f;
@@ -304,10 +328,26 @@ class DualBoard : public LibXR::Application {
   static constexpr float BULLET_SPEED_LIMIT = 25.5f;
   static_assert(sizeof(ControlFrame) == 8,
                 "ControlFrame must be one classic CAN frame");
+  static_assert(sizeof(ForceFrame) == 8,
+                "ForceFrame must be one classic CAN frame");
+  static_assert(
+      static_cast<uint8_t>(ChassisMode::RELAX) ==
+              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::RELAX) &&
+          static_cast<uint8_t>(ChassisMode::INDEPENDENT) ==
+              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::INDEPENDENT) &&
+          static_cast<uint8_t>(ChassisMode::ROTOR) ==
+              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::ROTOR) &&
+          static_cast<uint8_t>(ChassisMode::FOLLOW) ==
+              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::FOLLOW),
+      "DualBoard and chassis modes must use the same wire values");
   static_assert(sizeof(AngleFrame) == 8,
                 "AngleFrame must be one classic CAN frame");
   static_assert(sizeof(MotionFrame) == 8,
                 "MotionFrame must be one classic CAN frame");
+  static_assert(sizeof(ChassisYawFrame) == 8,
+                "ChassisYawFrame must be one classic CAN frame");
+  static_assert(sizeof(CapacitorFrame) == 8,
+                "CapacitorFrame must be one classic CAN frame");
   static_assert(sizeof(AttitudeFrame) == 8,
                 "AttitudeFrame must be one classic CAN frame");
   static_assert(sizeof(LauncherFeedbackFrame) == 8,
@@ -322,9 +362,15 @@ class DualBoard : public LibXR::Application {
                 "wheel telemetry pair must be one classic CAN frame");
   static_assert(sizeof(WheelTelemetryDiagnosticFrame) == 8,
                 "wheel telemetry diagnostic must be one classic CAN frame");
-  static_assert(WHEEL_TELEMETRY_META_ID_OFFSET >
+  static_assert(
+      WHEEL_TELEMETRY_PAIR23_ID_OFFSET + 1U == CAPACITOR_ID_OFFSET &&
+          CAPACITOR_ID_OFFSET + 1U == CHASSIS_YAW_ID_OFFSET,
+      "capacitor and chassis yaw CAN IDs must follow wheel telemetry");
+  static_assert(RefereeCanCodec::ROBOT_POS_ID_OFFSET + 6U <=
+                        WHEEL_TELEMETRY_META_ID_OFFSET &&
+                    WHEEL_TELEMETRY_PAIR23_ID_OFFSET <
                         RefereeCanCodec::LINK_STATUS_ID_OFFSET &&
-                    WHEEL_TELEMETRY_PAIR23_ID_OFFSET < DECISION_ID_OFFSET,
+                    RefereeCanCodec::LINK_STATUS_ID_OFFSET < DECISION_ID_OFFSET,
                 "wheel telemetry CAN IDs overlap existing fixed frames");
 
   static void RxThreadEntry(DualBoard* self) { self->RunRxThread(); }
@@ -382,6 +428,8 @@ class DualBoard : public LibXR::Application {
         return Referee::SOURCE_POWER_HEAT;
       case Referee::CommandID::REF_CMD_ID_ROBOT_POS:
         return Referee::SOURCE_ROBOT_POS;
+      case Referee::CommandID::REF_CMD_ID_ROBOT_POS_TO_SENTRY:
+        return Referee::SOURCE_SENTRY_POS;
       case Referee::CommandID::REF_CMD_ID_ROBOT_BUFF:
         return Referee::SOURCE_ROBOT_BUFF;
       case Referee::CommandID::REF_CMD_ID_ROBOT_DMG:
@@ -424,6 +472,12 @@ class DualBoard : public LibXR::Application {
           CreateTopic<Referee::RobotGameRefereePack>("sentry_ref");
       wheel_telemetry_topic_ =
           CreateTopic<ChassisWheelTelemetry>(wheel_telemetry_topic_name_);
+      chassis_imu_yaw_topic_ = CreateTopic<float>("chassis_imu_yaw");
+      chassis_imu_yaw_valid_topic_ = CreateTopic<bool>("chassis_imu_yaw_valid");
+      chassis_capacitor_capacity_topic_ =
+          CreateTopic<uint8_t>("chassis_capacitor_capacity");
+      chassis_capacitor_valid_topic_ =
+          CreateTopic<bool>("chassis_capacitor_valid");
     } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
       chassis_cmd_topic_ = CreateTopic<CMD::ChassisCMD>("chassis_cmd");
       yaw_angle_topic_ = CreateTopic<float>("yawmotor_angle");
@@ -437,6 +491,9 @@ class DualBoard : public LibXR::Application {
                             &DualBoard::OnLocalSentryRef>("sentry_ref");
       RegisterTopicCallback<Eigen::Matrix<float, 3, 1>,
                             &DualBoard::OnLocalChassisGyro>("chassis_gyro");
+      RegisterTopicCallback<LibXR::EulerAngle<float>,
+                            &DualBoard::OnLocalChassisEuler>(
+          chassis_euler_topic_name_);
       RegisterTopicCallback<ChassisWheelTelemetry,
                             &DualBoard::OnLocalWheelTelemetry>(
           wheel_telemetry_topic_name_);
@@ -617,6 +674,18 @@ class DualBoard : public LibXR::Application {
     }
   }
 
+  void OnLocalChassisEuler(const LibXR::EulerAngle<float>& euler) {
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      local_chassis_yaw_ = euler.Yaw();
+      chassis_yaw_valid_ = std::isfinite(local_chassis_yaw_);
+      local_chassis_yaw_time_ms_ =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+    } else {
+      UNUSED(euler);
+    }
+  }
+
   void OnLocalWheelTelemetry(const ChassisWheelTelemetry& telemetry) {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
@@ -733,9 +802,13 @@ class DualBoard : public LibXR::Application {
         SendGimbalControlFrames(now_ms);
         ExpireWheelTelemetryAssembly(now_ms);
         CheckWheelTelemetryWatchdog(now_ms);
+        CheckChassisYawWatchdog(now_ms);
+        CheckCapacitorWatchdog(now_ms);
         CheckOffline(now_ms);
       } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
         SendMotionFrameIfDue(now_ms);
+        SendChassisYawFrameIfDue(now_ms);
+        SendCapacitorFrameIfDue(now_ms);
         SendWheelTelemetryIfPending();
         SendLauncherFeedbackFrameIfDue(now_ms);
         SendRefereeFramesIfDue(now_ms);
@@ -887,6 +960,64 @@ class DualBoard : public LibXR::Application {
     SendClassicFrame(tx_id_ + ANGLE_ID_OFFSET, frame);
   }
 
+  void SendChassisYawFrameIfDue(uint32_t now_ms) {
+    if constexpr (ROLE != DualBoardRole::CHASSIS) {
+      UNUSED(now_ms);
+      return;
+    }
+    if (!IsDue(now_ms, next_chassis_yaw_tx_ms_, CONTROL_PERIOD_MS)) {
+      return;
+    }
+
+    float yaw = 0.0F;
+    bool valid = false;
+    uint32_t chassis_yaw_time_ms = 0U;
+    {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      yaw = local_chassis_yaw_;
+      valid = chassis_yaw_valid_;
+      chassis_yaw_time_ms = local_chassis_yaw_time_ms_;
+    }
+
+    ChassisYawFrame frame{};
+    frame.valid = valid && std::isfinite(yaw) &&
+                          now_ms - chassis_yaw_time_ms <= CHASSIS_YAW_TIMEOUT_MS
+                      ? 1U
+                      : 0U;
+    if (frame.valid != 0U) {
+      yaw = std::clamp(yaw, -3.2F, 3.2F);
+      frame.yaw_q = static_cast<int16_t>(std::lround(yaw * ANGLE_SCALE));
+    }
+    frame.sequence = chassis_yaw_sequence_++;
+    frame.sample_time_ms = now_ms;
+    SendClassicFrame(tx_id_ + CHASSIS_YAW_ID_OFFSET, frame);
+  }
+
+  void SendCapacitorFrameIfDue(uint32_t now_ms) {
+    if constexpr (ROLE != DualBoardRole::CHASSIS) {
+      UNUSED(now_ms);
+      return;
+    }
+    if (!IsDue(now_ms, next_capacitor_tx_ms_, CONTROL_PERIOD_MS)) {
+      return;
+    }
+
+    CapacitorFrame frame{};
+    if (power_control_ != nullptr) {
+      const PowerControlData DATA = power_control_->GetPowerControlData();
+      const bool VALID =
+          DATA.supercap_online && std::isfinite(DATA.cap_energy_normalized);
+      frame.valid = VALID ? 1U : 0U;
+      if (VALID) {
+        frame.capacity_percent = static_cast<uint8_t>(std::lround(
+            std::clamp(DATA.cap_energy_normalized, 0.0F, 1.0F) * 100.0F));
+      }
+    }
+    frame.sequence = capacitor_sequence_++;
+    frame.sample_time_ms = now_ms;
+    SendClassicFrame(tx_id_ + CAPACITOR_ID_OFFSET, frame);
+  }
+
   static int16_t EncodeWheelVelocity(float value, uint8_t& status) {
     const float SCALED = value * WHEEL_Q_SCALE;
     if (!std::isfinite(SCALED) ||
@@ -1000,12 +1131,23 @@ class DualBoard : public LibXR::Application {
       }
     }
 
+    Pldx::DualBoardControl::Command wire_command{};
+    wire_command.x = command.x;
+    wire_command.y = command.y;
+    wire_command.z = command.z;
+    wire_command.self_define = static_cast<int8_t>(command.self_define);
+    wire_command.mode = static_cast<Pldx::DualBoardControl::Mode>(mode);
+    wire_command.si_units = command.si_units;
+    wire_command.force_x_global_n = command.force_x_global_n;
+    wire_command.force_y_global_n = command.force_y_global_n;
+    wire_command.torque_z_global_nm = command.torque_z_global_nm;
+    wire_command.force_control = command.force_control;
     ControlFrame control_frame{};
-    control_frame.x = EncodeSigned(command.x, COMMAND_SCALE, COMMAND_LIMIT);
-    control_frame.y = EncodeSigned(command.y, COMMAND_SCALE, COMMAND_LIMIT);
-    control_frame.z = EncodeSigned(command.z, COMMAND_SCALE, COMMAND_LIMIT);
-    control_frame.self_define = static_cast<int8_t>(command.self_define);
-    control_frame.mode = mode;
+    static_cast<void>(
+        Pldx::DualBoardControl::Encode(wire_command, control_frame));
+    ForceFrame force_frame{};
+    static_cast<void>(Pldx::DualBoardControl::EncodeForce(
+        wire_command, force_frame, force_sequence_++));
 
     AngleFrame angle_frame{};
     angle_frame.yaw = EncodeSigned(yaw_angle, ANGLE_SCALE, ANGLE_LIMIT);
@@ -1021,6 +1163,7 @@ class DualBoard : public LibXR::Application {
     attitude_frame.sequence = angle_frame.sequence;
 
     SendClassicFrame(tx_id_ + CONTROL_ID_OFFSET, control_frame);
+    SendClassicFrame(tx_id_ + FORCE_ID_OFFSET, force_frame);
     SendClassicFrame(tx_id_ + ANGLE_ID_OFFSET, angle_frame);
     SendClassicFrame(tx_id_ + ATTITUDE_ID_OFFSET, attitude_frame);
   }
@@ -1104,9 +1247,9 @@ class DualBoard : public LibXR::Application {
       SendRefereeFragments(REFEREE_POWER_HEAT_ID_OFFSET,
                            referee_sequences_[4]++, referee_pack.power_heat);
     }
-    if ((pending_sources & Referee::SOURCE_ROBOT_POS) != 0U) {
-      SendRefereeFragments(REFEREE_ROBOT_POS_ID_OFFSET, referee_sequences_[5]++,
-                           referee_pack.robot_pos);
+    if ((pending_sources & Referee::SOURCE_SENTRY_POS) != 0U) {
+      SendRefereeFragments(REFEREE_ROBOT_POS_ID_OFFSET,
+                           referee_sequences_[10]++, referee_pack.sentry_pos);
     }
     if ((pending_sources & Referee::SOURCE_ROBOT_BUFF) != 0U) {
       SendRefereeFragments(REFEREE_ROBOT_BUFF_ID_OFFSET,
@@ -1145,8 +1288,16 @@ class DualBoard : public LibXR::Application {
     pack.id = id;
     pack.type = LibXR::CAN::Type::STANDARD;
     pack.dlc = sizeof(Frame);
-    std::memcpy(pack.data, &frame, sizeof(Frame));
+    LibXR::Memory::FastCopy(pack.data, &frame, sizeof(Frame));
     return can_->AddMessage(pack) == LibXR::ErrorCode::OK;
+  }
+
+  template <typename Frame>
+  static void LoadClassicFrame(const LibXR::CAN::ClassicPack& pack,
+                               Frame& frame) {
+    static_assert(sizeof(Frame) == 8U,
+                  "DualBoard fixed frames must fill classic CAN payload");
+    LibXR::Memory::FastCopy(&frame, pack.data, sizeof(Frame));
   }
 
   void HandleCanFrame(const LibXR::CAN::ClassicPack& pack) {
@@ -1158,6 +1309,8 @@ class DualBoard : public LibXR::Application {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
       if (offset == CONTROL_ID_OFFSET) {
         HandleControlFrame(pack);
+      } else if (offset == FORCE_ID_OFFSET) {
+        HandleForceFrame(pack);
       } else if (offset == ANGLE_ID_OFFSET) {
         HandleAngleFrame(pack);
       } else if (offset == DECISION_ID_OFFSET) {
@@ -1172,7 +1325,11 @@ class DualBoard : public LibXR::Application {
       if (HandleRefereeFrame(offset, pack)) {
         return;
       }
-      if (offset == CONTROL_ID_OFFSET) {
+      if (offset == CHASSIS_YAW_ID_OFFSET) {
+        HandleChassisYawFrame(pack);
+      } else if (offset == CAPACITOR_ID_OFFSET) {
+        HandleCapacitorFrame(pack);
+      } else if (offset == CONTROL_ID_OFFSET) {
         HandleLauncherFeedbackFrame(pack);
       } else if (offset == ANGLE_ID_OFFSET) {
         HandleMotionFrame(pack);
@@ -1234,7 +1391,7 @@ class DualBoard : public LibXR::Application {
       LibXR::Mutex::LockGuard lock(wheel_mutex_);
       if (offset == WHEEL_TELEMETRY_META_ID_OFFSET) {
         WheelTelemetryMetaFrame frame{};
-        std::memcpy(&frame, pack.data, sizeof(frame));
+        LoadClassicFrame(pack, frame);
         if (frame.version != WHEEL_TELEMETRY_VERSION ||
             !PrepareWheelFragment(frame.sequence, WHEEL_META_RECEIVED,
                                   NOW_MS)) {
@@ -1243,7 +1400,7 @@ class DualBoard : public LibXR::Application {
         wheel_assembly_.meta = frame;
       } else if (offset == WHEEL_TELEMETRY_PAIR01_ID_OFFSET) {
         WheelTelemetryPairFrame frame{};
-        std::memcpy(&frame, pack.data, sizeof(frame));
+        LoadClassicFrame(pack, frame);
         if (!PrepareWheelFragment(frame.sequence, WHEEL_PAIR01_RECEIVED,
                                   NOW_MS)) {
           return true;
@@ -1251,7 +1408,7 @@ class DualBoard : public LibXR::Application {
         wheel_assembly_.pair01 = frame;
       } else if (offset == WHEEL_TELEMETRY_DIAGNOSTIC_ID_OFFSET) {
         WheelTelemetryDiagnosticFrame frame{};
-        std::memcpy(&frame, pack.data, sizeof(frame));
+        LoadClassicFrame(pack, frame);
         if (!PrepareWheelFragment(frame.sequence, WHEEL_DIAGNOSTIC_RECEIVED,
                                   NOW_MS)) {
           return true;
@@ -1259,7 +1416,7 @@ class DualBoard : public LibXR::Application {
         wheel_assembly_.diagnostic = frame;
       } else {
         WheelTelemetryPairFrame frame{};
-        std::memcpy(&frame, pack.data, sizeof(frame));
+        LoadClassicFrame(pack, frame);
         if (!PrepareWheelFragment(frame.sequence, WHEEL_PAIR23_RECEIVED,
                                   NOW_MS)) {
           return true;
@@ -1377,7 +1534,7 @@ class DualBoard : public LibXR::Application {
   void HandleDecisionFrame(const LibXR::CAN::ClassicPack& pack) {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
       SentryDecisionFrame frame{};
-      std::memcpy(&frame, pack.data, sizeof(frame));
+      LoadClassicFrame(pack, frame);
       if (!SentryDecision::Validate(frame)) {
         return;
       }
@@ -1434,14 +1591,17 @@ class DualBoard : public LibXR::Application {
     }
 
     RefereeFragmentFrame frame{};
-    std::memcpy(&frame, pack.data, sizeof(frame));
+    LoadClassicFrame(pack, frame);
     const auto result = RefereeCanCodec::Push(
         assembly, static_cast<size_t>(offset - base_offset), frame, now_ms,
         output);
-    if (result != RefereeCanCodec::PushResult::COMPLETE) {
-      return true;
-    }
+    if (result != RefereeCanCodec::PushResult::COMPLETE) return false;
     local_referee_valid_mask_ |= source_mask;
+    if (source_mask == Referee::SOURCE_SENTRY_POS) {
+      gimbal_sentry_ref_.sentry_pos_received_time_ms = now_ms;
+    } else if (source_mask == Referee::SOURCE_ROBOT_HP) {
+      gimbal_sentry_ref_.robot_hp_received_time_ms = now_ms;
+    }
     gimbal_sentry_ref_.source_command_id = static_cast<uint16_t>(command_id);
     gimbal_sentry_ref_.source_valid_mask = RefereeCanCodec::IntersectValidity(
         upstream_referee_online_, local_referee_valid_mask_,
@@ -1462,7 +1622,7 @@ class DualBoard : public LibXR::Application {
         static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
     if (offset == REFEREE_LINK_STATUS_ID_OFFSET) {
       RefereeLinkStatusFrame frame{};
-      std::memcpy(&frame, pack.data, sizeof(frame));
+      LoadClassicFrame(pack, frame);
       upstream_referee_online_ = frame.referee_online == 1U;
       upstream_referee_valid_mask_ = frame.valid_mask & frame.supported_mask;
       if (!upstream_referee_online_) {
@@ -1481,7 +1641,7 @@ class DualBoard : public LibXR::Application {
     }
     if (offset == REFEREE_GAME_STATUS_ID_OFFSET) {
       RefereeFragmentFrame frame{};
-      std::memcpy(&frame, pack.data, sizeof(frame));
+      LoadClassicFrame(pack, frame);
       auto& assembly = referee_assemblies_[0];
       if (assembly.has_published &&
           assembly.published_sequence == frame.sequence) {
@@ -1491,8 +1651,8 @@ class DualBoard : public LibXR::Application {
       assembly.published_sequence = frame.sequence;
       gimbal_sentry_ref_.game_status.game_type = frame.data[0];
       gimbal_sentry_ref_.game_status.game_progress = frame.data[1];
-      std::memcpy(&gimbal_sentry_ref_.game_status.stage_remain_time,
-                  &frame.data[2], sizeof(uint16_t));
+      LibXR::Memory::FastCopy(&gimbal_sentry_ref_.game_status.stage_remain_time,
+                              &frame.data[2], sizeof(uint16_t));
       local_referee_valid_mask_ |= Referee::SOURCE_GAME_STATUS;
       gimbal_sentry_ref_.source_command_id =
           static_cast<uint16_t>(Referee::CommandID::REF_CMD_ID_GAME_STATUS);
@@ -1530,9 +1690,10 @@ class DualBoard : public LibXR::Application {
                          referee_assemblies_[4], power_heat,
                          Referee::SOURCE_POWER_HEAT,
                          Referee::CommandID::REF_CMD_ID_POWER_HEAT_DATA)
-    HANDLE_REFEREE_GROUP(
-        REFEREE_ROBOT_POS_ID_OFFSET, 2U, referee_assemblies_[5], robot_pos,
-        Referee::SOURCE_ROBOT_POS, Referee::CommandID::REF_CMD_ID_ROBOT_POS)
+    HANDLE_REFEREE_GROUP(REFEREE_ROBOT_POS_ID_OFFSET, 6U,
+                         referee_assemblies_[5], sentry_pos,
+                         Referee::SOURCE_SENTRY_POS,
+                         Referee::CommandID::REF_CMD_ID_ROBOT_POS_TO_SENTRY)
     HANDLE_REFEREE_GROUP(
         REFEREE_ROBOT_BUFF_ID_OFFSET, 2U, referee_assemblies_[6], robot_buff,
         Referee::SOURCE_ROBOT_BUFF, Referee::CommandID::REF_CMD_ID_ROBOT_BUFF)
@@ -1554,7 +1715,7 @@ class DualBoard : public LibXR::Application {
   void HandleMotionFrame(const LibXR::CAN::ClassicPack& pack) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       MotionFrame frame{};
-      std::memcpy(&frame, pack.data, sizeof(frame));
+      LoadClassicFrame(pack, frame);
 
       const auto now_ms =
           static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
@@ -1576,33 +1737,148 @@ class DualBoard : public LibXR::Application {
     }
   }
 
+  void HandleChassisYawFrame(const LibXR::CAN::ClassicPack& pack) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      ChassisYawFrame frame{};
+      LoadClassicFrame(pack, frame);
+      const bool valid = frame.valid == 1U &&
+                         std::abs(static_cast<int16_t>(frame.yaw_q)) <= 32000;
+      const float yaw = DecodeSigned(frame.yaw_q, ANGLE_SCALE);
+      const uint32_t now_ms =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+      const bool accepted = valid && std::isfinite(yaw);
+      chassis_imu_yaw_topic_.Publish(accepted ? yaw : 0.0F);
+      chassis_imu_yaw_valid_topic_.Publish(accepted);
+      last_chassis_yaw_rx_ms_ = now_ms;
+      chassis_yaw_stale_ = !accepted;
+    } else {
+      UNUSED(pack);
+    }
+  }
+
+  void CheckChassisYawWatchdog(uint32_t now_ms) {
+    if constexpr (ROLE != DualBoardRole::GIMBAL) {
+      UNUSED(now_ms);
+      return;
+    }
+    if (last_chassis_yaw_rx_ms_ != 0U &&
+        now_ms - last_chassis_yaw_rx_ms_ <= CHASSIS_YAW_TIMEOUT_MS) {
+      return;
+    }
+    if (chassis_yaw_stale_) {
+      return;
+    }
+    chassis_imu_yaw_topic_.Publish(0.0F);
+    chassis_imu_yaw_valid_topic_.Publish(false);
+    chassis_yaw_stale_ = true;
+  }
+
+  void HandleCapacitorFrame(const LibXR::CAN::ClassicPack& pack) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      CapacitorFrame frame{};
+      LoadClassicFrame(pack, frame);
+      const bool VALID = frame.valid == 1U && frame.capacity_percent <= 100U;
+      const uint32_t NOW_MS =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+      chassis_capacitor_capacity_topic_.Publish(VALID ? frame.capacity_percent
+                                                      : 255U);
+      chassis_capacitor_valid_topic_.Publish(VALID);
+      last_capacitor_rx_ms_ = NOW_MS;
+      capacitor_stale_ = !VALID;
+    } else {
+      UNUSED(pack);
+    }
+  }
+
+  void CheckCapacitorWatchdog(uint32_t now_ms) {
+    if constexpr (ROLE != DualBoardRole::GIMBAL) {
+      UNUSED(now_ms);
+      return;
+    }
+    if (last_capacitor_rx_ms_ != 0U &&
+        now_ms - last_capacitor_rx_ms_ <= CAPACITOR_TIMEOUT_MS) {
+      return;
+    }
+    if (capacitor_stale_) {
+      return;
+    }
+    chassis_capacitor_capacity_topic_.Publish(255U);
+    chassis_capacitor_valid_topic_.Publish(false);
+    capacitor_stale_ = true;
+  }
+
   void HandleControlFrame(const LibXR::CAN::ClassicPack& pack) {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
       ControlFrame frame{};
-      std::memcpy(&frame, pack.data, sizeof(frame));
-      if (!IsSupportedMode(frame.mode)) {
+      LoadClassicFrame(pack, frame);
+
+      const auto now_ms =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+      Pldx::DualBoardControl::ProcessResult result{};
+      {
+        LibXR::Mutex::LockGuard lock(control_admission_mutex_);
+        result = control_admission_.Process(frame, now_ms);
+      }
+      const bool restored = !online_;
+      last_rx_time_ms_ = now_ms;
+      online_ = true;
+      if (!result.accepted) {
+        PublishSafeChassisState();
+        safe_state_published_ = true;
         return;
       }
 
       CMD::ChassisCMD command{};
-      command.x = DecodeSigned(frame.x, COMMAND_SCALE);
-      command.y = DecodeSigned(frame.y, COMMAND_SCALE);
-      command.z = DecodeSigned(frame.z, COMMAND_SCALE);
-      command.self_define = static_cast<CMD::ChasStat>(frame.self_define);
+      command.x = result.command.x;
+      command.y = result.command.y;
+      command.z = result.command.z;
+      command.self_define =
+          static_cast<CMD::ChasStat>(result.command.self_define);
+      command.si_units = result.command.si_units;
+      command.force_control = result.command.force_control;
+      if (command.force_control) {
+        if (!remote_force_valid_ || !remote_force_control_ ||
+            now_ms - last_force_rx_ms_ > FORCE_TIMEOUT_MS) {
+          PublishSafeChassisState();
+          safe_state_published_ = true;
+          return;
+        }
+        command.force_x_global_n = remote_force_x_global_n_;
+        command.force_y_global_n = remote_force_y_global_n_;
+        command.torque_z_global_nm = remote_torque_z_global_nm_;
+      }
       chassis_cmd_topic_.Publish(command);
 
-      auto now_ms = static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-      bool restored = !online_;
-      last_rx_time_ms_ = now_ms;
-      online_ = true;
       safe_state_published_ = false;
 
-      if (restored || remote_mode_ != frame.mode) {
-        uint32_t mode = frame.mode;
+      const uint8_t MODE = static_cast<uint8_t>(result.command.mode);
+      if (restored || remote_mode_ != MODE) {
+        uint32_t mode = MODE;
         mode_topic_.Publish(mode);
         ForceRemoteMode(mode);
-        remote_mode_ = frame.mode;
+        remote_mode_ = MODE;
       }
+    } else {
+      UNUSED(pack);
+    }
+  }
+
+  void HandleForceFrame(const LibXR::CAN::ClassicPack& pack) {
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      ForceFrame frame{};
+      LoadClassicFrame(pack, frame);
+      Pldx::DualBoardControl::Command wire_command{};
+      if (!Pldx::DualBoardControl::DecodeForce(frame, wire_command)) {
+        remote_force_valid_ = false;
+        return;
+      }
+      remote_force_x_global_n_ = wire_command.force_x_global_n;
+      remote_force_y_global_n_ = wire_command.force_y_global_n;
+      remote_torque_z_global_nm_ = wire_command.torque_z_global_nm;
+      remote_force_control_ = wire_command.force_control;
+      remote_force_valid_ = true;
+      last_force_rx_ms_ =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
     } else {
       UNUSED(pack);
     }
@@ -1615,7 +1891,7 @@ class DualBoard : public LibXR::Application {
       }
 
       AngleFrame frame{};
-      std::memcpy(&frame, pack.data, sizeof(frame));
+      LoadClassicFrame(pack, frame);
       float yaw_angle = DecodeSigned(frame.yaw, ANGLE_SCALE);
       float pitch_angle = DecodeSigned(frame.pitch, ANGLE_SCALE);
       yaw_angle_topic_.Publish(yaw_angle);
@@ -1632,7 +1908,7 @@ class DualBoard : public LibXR::Application {
       }
 
       AttitudeFrame frame{};
-      std::memcpy(&frame, pack.data, sizeof(frame));
+      LoadClassicFrame(pack, frame);
       LibXR::EulerAngle<float> attitude(DecodeSigned(frame.roll, ANGLE_SCALE),
                                         DecodeSigned(frame.pitch, ANGLE_SCALE),
                                         DecodeSigned(frame.yaw, ANGLE_SCALE));
@@ -1645,7 +1921,7 @@ class DualBoard : public LibXR::Application {
   void HandleLauncherFeedbackFrame(const LibXR::CAN::ClassicPack& pack) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       LauncherFeedbackFrame frame{};
-      std::memcpy(&frame, pack.data, sizeof(frame));
+      LoadClassicFrame(pack, frame);
 
       Referee::LauncherPack launcher_pack{};
       launcher_pack.rs.shooter_heat_limit = frame.heat_limit;
@@ -1693,6 +1969,10 @@ class DualBoard : public LibXR::Application {
     }
 
     online_ = false;
+    {
+      LibXR::Mutex::LockGuard lock(control_admission_mutex_);
+      control_admission_.Reset();
+    }
     if (!safe_state_published_) {
       PublishOfflineState();
       safe_state_published_ = true;
@@ -1747,6 +2027,8 @@ class DualBoard : public LibXR::Application {
 
   void PublishSafeChassisState() {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      remote_force_valid_ = false;
+      remote_force_control_ = false;
       CMD::ChassisCMD command{};
       command.self_define = CMD::ChasStat::NONE;
       chassis_cmd_topic_.Publish(command);
@@ -1796,6 +2078,8 @@ class DualBoard : public LibXR::Application {
   const char* sentry_buy_resurrection_topic_name_;
   const char* sentry_state_topic_name_;
   const char* wheel_telemetry_topic_name_;
+  const char* chassis_euler_topic_name_;
+  PowerControl* power_control_;
 
   LibXR::Topic mode_topic_;
   LibXR::Topic chassis_cmd_topic_;
@@ -1811,6 +2095,10 @@ class DualBoard : public LibXR::Application {
   LibXR::Topic sentry_state_topic_;
   LibXR::Topic chassis_motion_state_topic_;
   LibXR::Topic wheel_telemetry_topic_;
+  LibXR::Topic chassis_imu_yaw_topic_;
+  LibXR::Topic chassis_imu_yaw_valid_topic_;
+  LibXR::Topic chassis_capacitor_capacity_topic_;
+  LibXR::Topic chassis_capacitor_valid_topic_;
   LibXR::Event dual_board_event_;
   LibXR::CAN::Callback can_rx_callback_;
 
@@ -1823,6 +2111,9 @@ class DualBoard : public LibXR::Application {
   LibXR::Thread protocol_thread_;
   LibXR::Mutex data_mutex_;
   LibXR::Mutex wheel_mutex_;
+  LibXR::Mutex control_admission_mutex_;
+
+  Pldx::DualBoardControl::AdmissionState control_admission_{};
 
   CMD::ChassisCMD local_chassis_command_{};
   float local_yaw_angle_ = 0.0f;
@@ -1842,6 +2133,9 @@ class DualBoard : public LibXR::Application {
   bool launcher_feedback_valid_ = false;
   Eigen::Matrix<float, 3, 1> local_chassis_gyro_{};
   bool chassis_gyro_received_ = false;
+  float local_chassis_yaw_ = 0.0F;
+  bool chassis_yaw_valid_ = false;
+  uint32_t local_chassis_yaw_time_ms_ = 0U;
   ChassisWheelTelemetry local_wheel_telemetry_{};
   ChassisWheelTelemetry last_wheel_telemetry_{};
   WheelTelemetryAssembly wheel_assembly_{};
@@ -1853,11 +2147,15 @@ class DualBoard : public LibXR::Application {
   SentryDecision::SequenceTracker decision_sequence_tracker_{};
 
   uint32_t next_control_tx_ms_ = 0;
+  uint32_t next_capacitor_tx_ms_ = 0U;
   uint32_t next_launcher_feedback_tx_ms_ = 0;
   uint32_t next_referee_status_tx_ms_ = 0U;
   uint32_t wheel_watchdog_start_ms_ =
       static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
   uint32_t last_wheel_rx_ms_ = 0U;
+  uint32_t last_chassis_yaw_rx_ms_ = 0U;
+  uint32_t last_capacitor_rx_ms_ = 0U;
+  uint32_t last_force_rx_ms_ = 0U;
   uint32_t last_wheel_stale_publish_ms_ = 0U;
   uint32_t last_rx_time_ms_ = 0;
   uint32_t last_decision_rx_time_ms_ = 0U;
@@ -1865,10 +2163,17 @@ class DualBoard : public LibXR::Application {
   uint32_t reported_decision_update_drops_ = 0U;
   uint8_t remote_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
   uint8_t tx_sequence_ = 0;
-  uint8_t referee_sequences_[10]{};
+  uint8_t force_sequence_ = 0U;
+  uint8_t capacitor_sequence_ = 0U;
+  uint8_t referee_sequences_[11]{};
   uint8_t referee_status_sequence_ = 0U;
   uint8_t decision_sequence_ = 0U;
   uint16_t last_wheel_sequence_ = 0U;
+  float remote_force_x_global_n_ = 0.0F;
+  float remote_force_y_global_n_ = 0.0F;
+  float remote_torque_z_global_nm_ = 0.0F;
+  bool remote_force_valid_ = false;
+  bool remote_force_control_ = false;
   bool online_ = false;
   bool safe_state_published_ = false;
   bool decision_drop_log_started_ = false;
@@ -1876,4 +2181,6 @@ class DualBoard : public LibXR::Application {
   bool wheel_completed_ = false;
   bool wheel_stream_received_ = false;
   bool wheel_stream_stale_ = false;
+  bool chassis_yaw_stale_ = true;
+  bool capacitor_stale_ = true;
 };
