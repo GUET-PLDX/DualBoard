@@ -8,7 +8,6 @@ constructor_args:
   - tx_id: 0x312
   - rx_id: 0x311
   - rx_buffer_size: 256
-  - tx_slot_count: 8
   - offline_timeout_ms: 100
   - chassis: '@nullptr'
   - mode_topic_name: "dualboard_chassis_mode"
@@ -18,7 +17,6 @@ constructor_args:
   - sentry_remote_buy_hp_times_topic_name: "sentry_remote_buy_hp_times"
   - sentry_buy_resurrection_topic_name: "sentry_buy_resurrection"
   - sentry_state_topic_name: "sentry_state"
-  - wheel_telemetry_topic_name: "chassis_wheel_telemetry"
   - chassis_euler_topic_name: "chassis_euler"
   - power_control: '@nullptr'
 template_args:
@@ -36,33 +34,569 @@ depends:
 // clang-format on
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 #include "CMD.hpp"
 #include "Chassis.hpp"
-#include "ChassisMotionState.hpp"
-#include "ChassisWheelTelemetry.hpp"
-#include "DualBoardControlFrame.hpp"
 #include "PowerControl.hpp"
 #include "Referee.hpp"
-#include "RefereeCanCodec.hpp"
-#include "SentryDecisionFrame.hpp"
 #include "app_framework.hpp"
 #include "can.hpp"
+#include "flag.hpp"
 #include "libxr_def.hpp"
 #include "libxr_mem.hpp"
 #include "logger.hpp"
 #include "message.hpp"
 #include "mutex.hpp"
-#include "queue/mpmc_queue.hpp"
+#include "queue/spsc_queue.hpp"
 #include "semaphore.hpp"
 #include "thread.hpp"
 #include "timebase.hpp"
 #include "transform.hpp"
+
+namespace Pldx::DualBoardControl {
+
+inline constexpr float NORMALIZED_SCALE = 32767.0F;
+inline constexpr float NAVIGATION_SCALE = 1000.0F;
+inline constexpr float NAVIGATION_WIRE_LIMIT = 32767.0F / NAVIGATION_SCALE;
+inline constexpr uint8_t NAVIGATION_SOURCE_BIT = 1U << 7U;
+inline constexpr uint8_t RESERVED_MASK = 0x70U;
+inline constexpr uint8_t MODE_MASK = 0x0FU;
+inline constexpr uint32_t USE_CAPACITOR_ID_OFFSET = 0x11U;
+inline constexpr char NAV_CHASSIS_MODE_TOPIC[] = "nav_chassis_mode";
+inline constexpr char USE_CAPACITOR_TOPIC[] = "use_capacitor";
+
+enum class Mode : uint8_t {
+  RELAX = 0U,
+  INDEPENDENT = 1U,
+  ROTOR = 2U,
+  FOLLOW = 3U,
+  NAVIGATION = 4U,
+};
+
+enum class Source : uint8_t {
+  OPERATOR = 0U,
+  NAVIGATION = 1U,
+};
+
+struct OperatorInput {
+  float x = 0.0F;
+  float y = 0.0F;
+  float z = 0.0F;
+};
+
+struct NavigationVelocity {
+  float vx_mps = 0.0F;
+  float vy_mps = 0.0F;
+  float wz_rad_s = 0.0F;
+};
+
+struct Command {
+  Source source = Source::OPERATOR;
+  OperatorInput operator_input{};
+  NavigationVelocity navigation_velocity{};
+  int8_t self_define = 0;
+  Mode mode = Mode::RELAX;
+};
+
+using Frame = std::array<uint8_t, 8U>;
+
+struct __attribute__((packed)) UseCapacitorCommand {
+  uint8_t enabled = 1U;
+  uint8_t sequence = 0U;
+  uint8_t reserved[6]{};
+};
+
+static_assert(sizeof(UseCapacitorCommand) == 8U);
+
+inline bool IsSupportedMode(Mode mode) {
+  return static_cast<uint8_t>(mode) <= static_cast<uint8_t>(Mode::NAVIGATION);
+}
+
+inline Mode SelectOutputMode(Mode rc_mode, bool nav_valid, Mode nav_mode,
+                             bool auto_ctrl, bool rc_lost) {
+  if (rc_lost) {
+    return Mode::RELAX;
+  }
+  if (auto_ctrl && nav_valid) {
+    return nav_mode;
+  }
+  return rc_mode;
+}
+
+inline bool IsSupportedSelfDefine(int8_t value) {
+  return value >= 0 && value <= 2;
+}
+
+inline void StoreSigned(Frame& frame, size_t offset, int16_t value) {
+  const auto RAW = static_cast<uint16_t>(value);
+  frame[offset] = static_cast<uint8_t>(RAW & 0xFFU);
+  frame[offset + 1U] = static_cast<uint8_t>(RAW >> 8U);
+}
+
+inline int16_t LoadSigned(const Frame& frame, size_t offset) {
+  const uint16_t RAW = static_cast<uint16_t>(frame[offset]) |
+                       (static_cast<uint16_t>(frame[offset + 1U]) << 8U);
+  return static_cast<int16_t>(RAW);
+}
+
+inline bool EncodeUseCapacitor(bool enabled, uint8_t sequence,
+                               UseCapacitorCommand& frame) {
+  frame = {};
+  frame.enabled = enabled ? 1U : 0U;
+  frame.sequence = sequence;
+  return true;
+}
+
+inline bool DecodeUseCapacitor(const UseCapacitorCommand& frame,
+                               bool& enabled) {
+  if (frame.enabled > 1U) {
+    return false;
+  }
+  for (uint8_t byte : frame.reserved) {
+    if (byte != 0U) {
+      return false;
+    }
+  }
+  enabled = frame.enabled == 1U;
+  return true;
+}
+
+inline Frame SafeFrame() { return {}; }
+
+inline bool NavigationVelocityFinite(const NavigationVelocity& velocity) {
+  return std::isfinite(velocity.vx_mps) && std::isfinite(velocity.vy_mps) &&
+         std::isfinite(velocity.wz_rad_s);
+}
+
+inline bool NavigationVelocityEncodable(const NavigationVelocity& velocity) {
+  return NavigationVelocityFinite(velocity) &&
+         std::fabs(velocity.vx_mps) <= NAVIGATION_WIRE_LIMIT &&
+         std::fabs(velocity.vy_mps) <= NAVIGATION_WIRE_LIMIT &&
+         std::fabs(velocity.wz_rad_s) <= NAVIGATION_WIRE_LIMIT;
+}
+
+inline bool Encode(const Command& command, Frame& frame) {
+  frame = SafeFrame();
+  if (!IsSupportedMode(command.mode) ||
+      !IsSupportedSelfDefine(command.self_define)) {
+    return false;
+  }
+
+  std::array<int16_t, 3U> encoded{};
+  if (command.source == Source::NAVIGATION) {
+    if (!NavigationVelocityEncodable(command.navigation_velocity)) return false;
+    const std::array<float, 3U> VALUES{command.navigation_velocity.vx_mps,
+                                       command.navigation_velocity.vy_mps,
+                                       command.navigation_velocity.wz_rad_s};
+    for (size_t index = 0U; index < VALUES.size(); ++index) {
+      encoded[index] =
+          static_cast<int16_t>(std::round(VALUES[index] * NAVIGATION_SCALE));
+    }
+  } else {
+    const std::array<float, 3U> VALUES{command.operator_input.x,
+                                       command.operator_input.y,
+                                       command.operator_input.z};
+    for (size_t index = 0U; index < VALUES.size(); ++index) {
+      if (!std::isfinite(VALUES[index])) return false;
+      const float CLAMPED = std::clamp(VALUES[index], -1.0F, 1.0F);
+      encoded[index] = static_cast<int16_t>(CLAMPED * NORMALIZED_SCALE);
+    }
+  }
+
+  StoreSigned(frame, 0U, encoded[0]);
+  StoreSigned(frame, 2U, encoded[1]);
+  StoreSigned(frame, 4U, encoded[2]);
+  frame[6] = static_cast<uint8_t>(command.self_define);
+  frame[7] =
+      static_cast<uint8_t>(command.mode) |
+      (command.source == Source::NAVIGATION ? NAVIGATION_SOURCE_BIT : 0U);
+  return true;
+}
+
+inline bool Decode(const Frame& frame, Command& command) {
+  command = {};
+  const uint8_t MODE_RAW = frame[7];
+  if ((MODE_RAW & RESERVED_MASK) != 0U) {
+    return false;
+  }
+  const auto MODE = static_cast<Mode>(MODE_RAW & MODE_MASK);
+  const auto SELF_DEFINE = static_cast<int8_t>(frame[6]);
+  if (!IsSupportedMode(MODE) || !IsSupportedSelfDefine(SELF_DEFINE)) {
+    return false;
+  }
+
+  const std::array<int16_t, 3U> RAW{
+      LoadSigned(frame, 0U), LoadSigned(frame, 2U), LoadSigned(frame, 4U)};
+  for (const auto VALUE : RAW) {
+    if (VALUE == std::numeric_limits<int16_t>::min()) {
+      return false;
+    }
+  }
+
+  command.self_define = SELF_DEFINE;
+  command.mode = MODE;
+  command.source = (MODE_RAW & NAVIGATION_SOURCE_BIT) != 0U ? Source::NAVIGATION
+                                                            : Source::OPERATOR;
+  if (command.source == Source::NAVIGATION) {
+    command.navigation_velocity.vx_mps =
+        static_cast<float>(RAW[0]) / NAVIGATION_SCALE;
+    command.navigation_velocity.vy_mps =
+        static_cast<float>(RAW[1]) / NAVIGATION_SCALE;
+    command.navigation_velocity.wz_rad_s =
+        static_cast<float>(RAW[2]) / NAVIGATION_SCALE;
+    return NavigationVelocityFinite(command.navigation_velocity);
+  }
+  command.operator_input.x = static_cast<float>(RAW[0]) / NORMALIZED_SCALE;
+  command.operator_input.y = static_cast<float>(RAW[1]) / NORMALIZED_SCALE;
+  command.operator_input.z = static_cast<float>(RAW[2]) / NORMALIZED_SCALE;
+  return true;
+}
+
+inline constexpr const char* CHASSIS_MOTION_STATE_TOPIC_NAME =
+    "chassis_motion_state";
+inline constexpr bool CHASSIS_MOTION_STATE_TOPIC_MULTI_PUBLISHER = true;
+
+enum class ChassisMotionMode : uint8_t { NON_ROTOR, ROTOR };
+
+struct ChassisMotionState {
+  float yaw_rate_rad_s = 0.0f;
+  bool yaw_rate_valid = false;
+  bool online = false;
+  ChassisMotionMode mode = ChassisMotionMode::NON_ROTOR;
+};
+
+}  // namespace Pldx::DualBoardControl
+
+class RefereeCanCodec {
+ public:
+  static constexpr uint32_t GAME_STATUS_ID_OFFSET = 0x02U;
+  static constexpr uint32_t FIELD_EVENT_ID_OFFSET = 0x03U;
+  static constexpr uint32_t ROBOT_HP_ID_OFFSET = 0x04U;
+  static constexpr uint32_t ROBOT_STATUS_ID_OFFSET = 0x07U;
+  static constexpr uint32_t POWER_HEAT_ID_OFFSET = 0x0AU;
+  static constexpr uint32_t ROBOT_BUFF_ID_OFFSET = 0x0CU;
+  static constexpr uint32_t BULLET_REMAIN_ID_OFFSET = 0x0EU;
+  static constexpr uint32_t RFID_ID_OFFSET = 0x12U;
+  static constexpr uint32_t ROBOT_DAMAGE_ID_OFFSET = 0x13U;
+  // Position payload uses six dedicated classic-CAN frames (40 bytes).
+  static constexpr uint32_t ROBOT_POS_ID_OFFSET = 0x14U;
+  static constexpr uint32_t LINK_STATUS_ID_OFFSET = 0x1EU;
+  static constexpr uint32_t REASSEMBLY_TIMEOUT_MS = 20U;
+  static constexpr size_t FRAGMENT_DATA_SIZE = 7U;
+  // RobotPosForSentry is ten IEEE-754 floats (40 bytes); leave room for the
+  // complete payload while retaining the seven-byte data area per CAN frame.
+  static constexpr size_t MAX_DATA_SIZE = 42U;
+
+  struct __attribute__((packed)) FragmentFrame {
+    uint8_t sequence = 0U;
+    uint8_t data[FRAGMENT_DATA_SIZE]{};
+  };
+
+  struct Assembly {
+    uint8_t sequence = 0U;
+    uint8_t received_mask = 0U;
+    uint8_t published_sequence = 0U;
+    uint32_t last_update_ms = 0U;
+    uint8_t data[MAX_DATA_SIZE]{};
+    bool active = false;
+    bool has_published = false;
+  };
+
+  enum class PushResult : uint8_t {
+    INVALID,
+    INCOMPLETE,
+    COMPLETE,
+    DUPLICATE,
+  };
+
+  template <typename Data>
+  static auto Encode(uint8_t sequence, const Data& data) {
+    static_assert(std::is_trivially_copyable_v<Data>);
+    static_assert(sizeof(Data) <= MAX_DATA_SIZE);
+    constexpr size_t FRAGMENT_COUNT =
+        (sizeof(Data) + FRAGMENT_DATA_SIZE - 1U) / FRAGMENT_DATA_SIZE;
+    std::array<FragmentFrame, FRAGMENT_COUNT> frames{};
+    const auto* bytes = reinterpret_cast<const uint8_t*>(&data);
+    for (size_t index = 0U; index < frames.size(); ++index) {
+      frames[index].sequence = sequence;
+      const size_t byte_offset = index * FRAGMENT_DATA_SIZE;
+      const size_t byte_count = std::min(
+          FRAGMENT_DATA_SIZE, static_cast<size_t>(sizeof(Data) - byte_offset));
+      LibXR::Memory::FastCopy(frames[index].data, bytes + byte_offset,
+                              byte_count);
+    }
+    return frames;
+  }
+
+  template <typename Data>
+  static PushResult Push(Assembly& assembly, size_t fragment_index,
+                         const FragmentFrame& frame, uint32_t now_ms,
+                         Data& output) {
+    static_assert(std::is_trivially_copyable_v<Data>);
+    static_assert(sizeof(Data) <= MAX_DATA_SIZE);
+    constexpr size_t FRAGMENT_COUNT =
+        (sizeof(Data) + FRAGMENT_DATA_SIZE - 1U) / FRAGMENT_DATA_SIZE;
+    static_assert(FRAGMENT_COUNT <= 8U);
+    if (fragment_index >= FRAGMENT_COUNT) {
+      return PushResult::INVALID;
+    }
+
+    Expire(assembly, now_ms);
+    if (!assembly.active || assembly.sequence != frame.sequence) {
+      assembly = {};
+      assembly.active = true;
+      assembly.sequence = frame.sequence;
+    }
+    if (now_ms >= assembly.last_update_ms) assembly.last_update_ms = now_ms;
+
+    const size_t byte_offset = fragment_index * FRAGMENT_DATA_SIZE;
+    const size_t byte_count = std::min(
+        FRAGMENT_DATA_SIZE, static_cast<size_t>(sizeof(Data) - byte_offset));
+    LibXR::Memory::FastCopy(assembly.data + byte_offset, frame.data,
+                            byte_count);
+    assembly.received_mask |= static_cast<uint8_t>(1U << fragment_index);
+    constexpr uint8_t EXPECTED_MASK =
+        static_cast<uint8_t>((1U << FRAGMENT_COUNT) - 1U);
+    if (assembly.received_mask != EXPECTED_MASK) {
+      return PushResult::INCOMPLETE;
+    }
+    if (assembly.has_published &&
+        assembly.published_sequence == frame.sequence) {
+      return PushResult::DUPLICATE;
+    }
+
+    LibXR::Memory::FastCopy(&output, assembly.data, sizeof(Data));
+    assembly.has_published = true;
+    assembly.published_sequence = frame.sequence;
+    return PushResult::COMPLETE;
+  }
+
+  static bool Expire(Assembly& assembly, uint32_t now_ms) {
+    if (!assembly.active || now_ms < assembly.last_update_ms ||
+        now_ms - assembly.last_update_ms <= REASSEMBLY_TIMEOUT_MS) {
+      return false;
+    }
+    assembly.active = false;
+    assembly.received_mask = 0U;
+    return true;
+  }
+
+  static constexpr uint16_t IntersectValidity(bool online, uint16_t local_mask,
+                                              uint16_t upstream_mask,
+                                              uint16_t supported_mask) {
+    return online ? static_cast<uint16_t>(local_mask & upstream_mask &
+                                          supported_mask)
+                  : 0U;
+  }
+};
+
+static_assert(sizeof(RefereeCanCodec::FragmentFrame) == 8U);
+
+struct __attribute__((packed)) SentryDecisionFrame {
+  uint8_t version;
+  uint8_t sequence;
+  uint8_t valid_mask;
+  uint8_t state;
+  uint16_t buy_bullet_delta;
+  uint8_t remote_request_counts;
+  uint8_t flags;
+};
+
+static_assert(sizeof(SentryDecisionFrame) == 8U);
+
+namespace SentryDecision {
+
+constexpr uint8_t VERSION = 1U;
+constexpr uint8_t STATE_VALID = 0x01U;
+constexpr uint8_t BUY_BULLET_VALID = 0x02U;
+constexpr uint8_t REMOTE_BULLET_VALID = 0x04U;
+constexpr uint8_t REMOTE_HP_VALID = 0x08U;
+constexpr uint8_t BUY_RESURRECTION_VALID = 0x10U;
+constexpr uint8_t KNOWN_VALID_MASK = 0x1fU;
+constexpr uint8_t BUY_RESURRECTION_FLAG = 0x01U;
+constexpr uint32_t RX_TIMEOUT_MS = 100U;
+constexpr uint32_t RETRY_PERIOD_MS = 10U;
+constexpr uint8_t REQUIRED_SEND_SUCCESSES = 5U;
+
+constexpr uint8_t PackRemoteCounts(uint8_t bullet, uint8_t hp) {
+  return static_cast<uint8_t>((bullet & 0x0fU) | ((hp & 0x0fU) << 4U));
+}
+
+constexpr uint8_t RemoteBulletCount(uint8_t value) { return value & 0x0fU; }
+
+constexpr uint8_t RemoteHpCount(uint8_t value) {
+  return static_cast<uint8_t>((value >> 4U) & 0x0fU);
+}
+
+enum class UpdateKind : uint8_t {
+  BUY_BULLET,
+  REMOTE_BUY_BULLET,
+  REMOTE_BUY_HP,
+  BUY_RESURRECTION,
+  STATE,
+};
+
+inline void accumulate(SentryDecisionFrame& pending, UpdateKind kind,
+                       uint16_t value) {
+  switch (kind) {
+    case UpdateKind::BUY_BULLET: {
+      const uint32_t TOTAL = pending.buy_bullet_delta + value;
+      pending.buy_bullet_delta = static_cast<uint16_t>(std::min(TOTAL, 2047U));
+      pending.valid_mask |= BUY_BULLET_VALID;
+      break;
+    }
+    case UpdateKind::REMOTE_BUY_BULLET: {
+      const uint8_t BULLET_COUNT = static_cast<uint8_t>(std::min<uint16_t>(
+          RemoteBulletCount(pending.remote_request_counts) + value, 15U));
+      const uint8_t HP_COUNT = RemoteHpCount(pending.remote_request_counts);
+      pending.remote_request_counts = PackRemoteCounts(BULLET_COUNT, HP_COUNT);
+      pending.valid_mask |= REMOTE_BULLET_VALID;
+      break;
+    }
+    case UpdateKind::REMOTE_BUY_HP: {
+      const uint8_t BULLET_COUNT =
+          RemoteBulletCount(pending.remote_request_counts);
+      const uint8_t HP_COUNT = static_cast<uint8_t>(std::min<uint16_t>(
+          RemoteHpCount(pending.remote_request_counts) + value, 15U));
+      pending.remote_request_counts = PackRemoteCounts(BULLET_COUNT, HP_COUNT);
+      pending.valid_mask |= REMOTE_HP_VALID;
+      break;
+    }
+    case UpdateKind::BUY_RESURRECTION:
+      if (value != 0U) {
+        pending.flags |= BUY_RESURRECTION_FLAG;
+      } else {
+        pending.flags &= static_cast<uint8_t>(~BUY_RESURRECTION_FLAG);
+      }
+      pending.valid_mask |= BUY_RESURRECTION_VALID;
+      break;
+    case UpdateKind::STATE:
+      pending.state = static_cast<uint8_t>(value);
+      pending.valid_mask |= STATE_VALID;
+      break;
+  }
+}
+
+inline bool Validate(const SentryDecisionFrame& frame) {
+  if (frame.version != VERSION ||
+      (frame.valid_mask & static_cast<uint8_t>(~KNOWN_VALID_MASK)) != 0U ||
+      (frame.flags & static_cast<uint8_t>(~BUY_RESURRECTION_FLAG)) != 0U) {
+    return false;
+  }
+
+  if ((frame.valid_mask & STATE_VALID) != 0U) {
+    if (frame.state < 1U || frame.state > 3U) {
+      return false;
+    }
+  } else if (frame.state != 0U) {
+    return false;
+  }
+
+  if ((frame.valid_mask & BUY_BULLET_VALID) != 0U) {
+    if (frame.buy_bullet_delta < 1U || frame.buy_bullet_delta > 2047U) {
+      return false;
+    }
+  } else if (frame.buy_bullet_delta != 0U) {
+    return false;
+  }
+
+  if ((frame.valid_mask & REMOTE_BULLET_VALID) == 0U &&
+      RemoteBulletCount(frame.remote_request_counts) != 0U) {
+    return false;
+  }
+  if ((frame.valid_mask & REMOTE_HP_VALID) == 0U &&
+      RemoteHpCount(frame.remote_request_counts) != 0U) {
+    return false;
+  }
+  if ((frame.valid_mask & BUY_RESURRECTION_VALID) == 0U && frame.flags != 0U) {
+    return false;
+  }
+
+  return true;
+}
+
+class SequenceTracker {
+ public:
+  bool Accept(uint8_t sequence, uint32_t now_ms) {
+    if (valid_ && sequence == last_sequence_ &&
+        now_ms - last_rx_ms_ <= RX_TIMEOUT_MS) {
+      ObserveDuplicate(now_ms);
+      return false;
+    }
+
+    valid_ = true;
+    last_sequence_ = sequence;
+    last_rx_ms_ = now_ms;
+    return true;
+  }
+
+  void ObserveDuplicate(uint32_t now_ms) { last_rx_ms_ = now_ms; }
+
+ private:
+  bool valid_ = false;
+  uint8_t last_sequence_ = 0U;
+  uint32_t last_rx_ms_ = 0U;
+};
+
+class RetryController {
+ public:
+  bool Begin(const SentryDecisionFrame& frame, uint8_t sequence,
+             uint32_t now_ms) {
+    if (active_) {
+      return false;
+    }
+
+    frame_ = frame;
+    frame_.sequence = sequence;
+    active_ = true;
+    successes_ = 0U;
+    next_send_ms_ = now_ms;
+    return true;
+  }
+
+  bool Due(uint32_t now_ms) const {
+    return active_ && (now_ms - next_send_ms_) < 0x80000000U;
+  }
+
+  void OnSendResult(bool sent, uint32_t now_ms) {
+    if (!active_) {
+      return;
+    }
+
+    if (sent) {
+      ++successes_;
+      if (successes_ >= REQUIRED_SEND_SUCCESSES) {
+        active_ = false;
+        return;
+      }
+    }
+    next_send_ms_ = now_ms + RETRY_PERIOD_MS;
+  }
+
+  bool Active() const { return active_; }
+  uint8_t Successes() const { return successes_; }
+  const SentryDecisionFrame& Frame() const { return frame_; }
+
+ private:
+  SentryDecisionFrame frame_{};
+  bool active_ = false;
+  uint8_t successes_ = 0U;
+  uint32_t next_send_ms_ = 0U;
+};
+
+}  // namespace SentryDecision
+
+using Pldx::DualBoardControl::CHASSIS_MOTION_STATE_TOPIC_MULTI_PUBLISHER;
+using Pldx::DualBoardControl::CHASSIS_MOTION_STATE_TOPIC_NAME;
+using Pldx::DualBoardControl::ChassisMotionMode;
+using Pldx::DualBoardControl::ChassisMotionState;
 
 /**
  * @brief 双板角色。
@@ -81,8 +615,8 @@ class DualBoard : public LibXR::Application {
   DualBoard(
       LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
       const char* can_bus_name, uint32_t tx_id, uint32_t rx_id,
-      uint32_t rx_buffer_size, uint32_t tx_slot_count,
-      uint32_t offline_timeout_ms, Chassis<ChassisType>* chassis,
+      uint32_t rx_buffer_size, uint32_t offline_timeout_ms,
+      Chassis<ChassisType>* chassis,
       const char* mode_topic_name = "dualboard_chassis_mode",
       CMD* cmd = nullptr,
       const char* sentry_buy_bullet_num_topic_name = "sentry_buy_bullet_num",
@@ -93,14 +627,11 @@ class DualBoard : public LibXR::Application {
       const char* sentry_buy_resurrection_topic_name =
           "sentry_buy_resurrection",
       const char* sentry_state_topic_name = "sentry_state",
-      const char* wheel_telemetry_topic_name = "chassis_wheel_telemetry",
       const char* chassis_euler_topic_name = "chassis_euler",
       PowerControl* power_control = nullptr)
       : can_(hw.template FindOrExit<LibXR::CAN>({can_bus_name})),
         tx_id_(tx_id),
         rx_id_(rx_id),
-        rx_buffer_size_(rx_buffer_size),
-        tx_slot_count_(tx_slot_count),
         offline_timeout_ms_(offline_timeout_ms),
         chassis_(chassis),
         cmd_(cmd),
@@ -112,12 +643,10 @@ class DualBoard : public LibXR::Application {
             sentry_remote_buy_hp_times_topic_name),
         sentry_buy_resurrection_topic_name_(sentry_buy_resurrection_topic_name),
         sentry_state_topic_name_(sentry_state_topic_name),
-        wheel_telemetry_topic_name_(wheel_telemetry_topic_name),
         chassis_euler_topic_name_(chassis_euler_topic_name),
         power_control_(power_control),
         rx_frames_(rx_buffer_size) {
-    ASSERT(rx_buffer_size_ > 0U);
-    ASSERT(tx_slot_count_ > 0U);
+    ASSERT(rx_buffer_size > 0U);
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
       ASSERT(chassis_ != nullptr);
     } else {
@@ -137,14 +666,7 @@ class DualBoard : public LibXR::Application {
     app.Register(*this);
   }
 
-  void OnMonitor() override {
-    if (offline_timeout_ms_ == 0U || last_rx_time_ms_ == 0U) {
-      return;
-    }
-
-    auto now_ms = static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-    online_ = (now_ms - last_rx_time_ms_) <= offline_timeout_ms_;
-  }
+  void OnMonitor() override {}
 
   LibXR::Event& GetEvent() { return dual_board_event_; }
 
@@ -152,7 +674,6 @@ class DualBoard : public LibXR::Application {
 
  private:
   using ControlFrame = Pldx::DualBoardControl::Frame;
-  using ForceFrame = Pldx::DualBoardControl::ForceFrame;
 
   struct __attribute__((packed)) AngleFrame {
     int16_t yaw;
@@ -216,60 +737,15 @@ class DualBoard : public LibXR::Application {
     uint16_t stage_remain_time;
   };
 
-  struct __attribute__((packed)) WheelTelemetryMetaFrame {
-    uint8_t version;
-    uint16_t sequence;
-    uint32_t sample_time_us;
-    uint8_t global_status;
-  };
-
-  struct __attribute__((packed)) WheelTelemetryPairFrame {
-    uint16_t sequence;
-    int16_t first_wheel_q;
-    int16_t second_wheel_q;
-    uint8_t first_status;
-    uint8_t second_status;
-  };
-
-  struct __attribute__((packed)) WheelTelemetryDiagnosticFrame {
-    uint16_t sequence;
-    int16_t vx_mm_s;
-    int16_t vy_mm_s;
-    int16_t wz_mrad_s;
-  };
-
-  struct WheelTelemetryAssembly {
-    WheelTelemetryMetaFrame meta{};
-    WheelTelemetryPairFrame pair01{};
-    WheelTelemetryDiagnosticFrame diagnostic{};
-    WheelTelemetryPairFrame pair23{};
-    uint32_t started_ms = 0U;
-    uint16_t sequence = 0U;
-    uint8_t received_mask = 0U;
-    bool active = false;
-  };
-
-  enum class DecisionUpdateKind : uint8_t {
-    BUY_BULLET,
-    REMOTE_BUY_BULLET,
-    REMOTE_BUY_HP,
-    BUY_RESURRECTION,
-    STATE,
-  };
-
-  struct DecisionUpdate {
-    DecisionUpdateKind kind;
-    uint16_t value;
-  };
-
   using RefereeAssembly = RefereeCanCodec::Assembly;
 
   static constexpr uint32_t CONTROL_PERIOD_MS = 10;
   static constexpr uint32_t LAUNCHER_FEEDBACK_PERIOD_MS = 20;
   static constexpr uint32_t PROTOCOL_THREAD_PERIOD_MS = 2;
   static constexpr uint32_t CONTROL_ID_OFFSET = 0x00U;
-  static constexpr uint32_t FORCE_ID_OFFSET = 0x01U;
   static constexpr uint32_t ANGLE_ID_OFFSET = 0x10U;
+  static constexpr uint32_t USE_CAPACITOR_ID_OFFSET =
+      Pldx::DualBoardControl::USE_CAPACITOR_ID_OFFSET;
   static constexpr uint16_t DECISION_ID_OFFSET = 0x1fU;
   static constexpr uint32_t ATTITUDE_ID_OFFSET = 0x20U;
   // Bottom-board yaw is sent on 0x330 (chassis tx_id 0x311 + 0x1f).
@@ -277,7 +753,6 @@ class DualBoard : public LibXR::Application {
   static constexpr uint32_t CAPACITOR_ID_OFFSET = 0x1EU;
   static constexpr uint32_t CHASSIS_YAW_TIMEOUT_MS = 100U;
   static constexpr uint32_t CAPACITOR_TIMEOUT_MS = 150U;
-  static constexpr uint32_t FORCE_TIMEOUT_MS = 150U;
   static constexpr uint32_t REFEREE_GAME_STATUS_ID_OFFSET =
       RefereeCanCodec::GAME_STATUS_ID_OFFSET;
   static constexpr uint32_t REFEREE_FIELD_EVENT_ID_OFFSET =
@@ -301,23 +776,6 @@ class DualBoard : public LibXR::Application {
   static constexpr uint32_t REFEREE_LINK_STATUS_ID_OFFSET =
       RefereeCanCodec::LINK_STATUS_ID_OFFSET;
   static constexpr uint32_t REFEREE_STATUS_PERIOD_MS = 1000U;
-  static constexpr uint8_t WHEEL_TELEMETRY_VERSION = 1U;
-  static constexpr uint32_t WHEEL_TELEMETRY_META_ID_OFFSET = 0x1AU;
-  static constexpr uint32_t WHEEL_TELEMETRY_PAIR01_ID_OFFSET = 0x1BU;
-  static constexpr uint32_t WHEEL_TELEMETRY_DIAGNOSTIC_ID_OFFSET = 0x1CU;
-  static constexpr uint32_t WHEEL_TELEMETRY_PAIR23_ID_OFFSET = 0x1DU;
-  static constexpr uint8_t WHEEL_META_RECEIVED = 1U << 0;
-  static constexpr uint8_t WHEEL_PAIR01_RECEIVED = 1U << 1;
-  static constexpr uint8_t WHEEL_DIAGNOSTIC_RECEIVED = 1U << 2;
-  static constexpr uint8_t WHEEL_PAIR23_RECEIVED = 1U << 3;
-  static constexpr uint8_t WHEEL_REQUIRED_MASK =
-      WHEEL_META_RECEIVED | WHEEL_PAIR01_RECEIVED | WHEEL_PAIR23_RECEIVED;
-  static constexpr uint32_t WHEEL_ASSEMBLY_TIMEOUT_MS = 20U;
-  static constexpr uint32_t WHEEL_STREAM_TIMEOUT_MS = 50U;
-  static constexpr uint32_t WHEEL_STALE_HEARTBEAT_MS = 100U;
-  static constexpr float WHEEL_Q_SCALE = 256.0f;
-  static constexpr float DIAGNOSTIC_LINEAR_SCALE = 1000.0f;
-  static constexpr float DIAGNOSTIC_ANGULAR_SCALE = 1000.0f;
   static constexpr uint32_t DECISION_DROP_LOG_PERIOD_MS = 1000U;
   static constexpr size_t DECISION_UPDATE_QUEUE_CAPACITY = 32U;
   static constexpr uint32_t RX_ID_RANGE = ATTITUDE_ID_OFFSET;
@@ -328,8 +786,15 @@ class DualBoard : public LibXR::Application {
   static constexpr float BULLET_SPEED_LIMIT = 25.5f;
   static_assert(sizeof(ControlFrame) == 8,
                 "ControlFrame must be one classic CAN frame");
-  static_assert(sizeof(ForceFrame) == 8,
-                "ForceFrame must be one classic CAN frame");
+  static_assert(sizeof(Pldx::DualBoardControl::UseCapacitorCommand) == 8,
+                "UseCapacitorCommand must be one classic CAN frame");
+  static_assert(
+      USE_CAPACITOR_ID_OFFSET != CONTROL_ID_OFFSET &&
+          USE_CAPACITOR_ID_OFFSET != ANGLE_ID_OFFSET &&
+          USE_CAPACITOR_ID_OFFSET != DECISION_ID_OFFSET &&
+          USE_CAPACITOR_ID_OFFSET != ATTITUDE_ID_OFFSET &&
+          USE_CAPACITOR_ID_OFFSET <= RX_ID_RANGE,
+      "use_capacitor CAN ID must stay in the gimbal-to-chassis range");
   static_assert(
       static_cast<uint8_t>(ChassisMode::RELAX) ==
               static_cast<uint8_t>(Pldx::DualBoardControl::Mode::RELAX) &&
@@ -338,7 +803,9 @@ class DualBoard : public LibXR::Application {
           static_cast<uint8_t>(ChassisMode::ROTOR) ==
               static_cast<uint8_t>(Pldx::DualBoardControl::Mode::ROTOR) &&
           static_cast<uint8_t>(ChassisMode::FOLLOW) ==
-              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::FOLLOW),
+              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::FOLLOW) &&
+          static_cast<uint8_t>(ChassisMode::NAVIGATION) ==
+              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::NAVIGATION),
       "DualBoard and chassis modes must use the same wire values");
   static_assert(sizeof(AngleFrame) == 8,
                 "AngleFrame must be one classic CAN frame");
@@ -356,22 +823,10 @@ class DualBoard : public LibXR::Application {
                 "RefereeFragmentFrame must be one classic CAN frame");
   static_assert(sizeof(RefereeLinkStatusFrame) == 8,
                 "RefereeLinkStatusFrame must be one classic CAN frame");
-  static_assert(sizeof(WheelTelemetryMetaFrame) == 8,
-                "wheel telemetry meta must be one classic CAN frame");
-  static_assert(sizeof(WheelTelemetryPairFrame) == 8,
-                "wheel telemetry pair must be one classic CAN frame");
-  static_assert(sizeof(WheelTelemetryDiagnosticFrame) == 8,
-                "wheel telemetry diagnostic must be one classic CAN frame");
-  static_assert(
-      WHEEL_TELEMETRY_PAIR23_ID_OFFSET + 1U == CAPACITOR_ID_OFFSET &&
-          CAPACITOR_ID_OFFSET + 1U == CHASSIS_YAW_ID_OFFSET,
-      "capacitor and chassis yaw CAN IDs must follow wheel telemetry");
-  static_assert(RefereeCanCodec::ROBOT_POS_ID_OFFSET + 6U <=
-                        WHEEL_TELEMETRY_META_ID_OFFSET &&
-                    WHEEL_TELEMETRY_PAIR23_ID_OFFSET <
-                        RefereeCanCodec::LINK_STATUS_ID_OFFSET &&
-                    RefereeCanCodec::LINK_STATUS_ID_OFFSET < DECISION_ID_OFFSET,
-                "wheel telemetry CAN IDs overlap existing fixed frames");
+  static_assert(CAPACITOR_ID_OFFSET + 1U == CHASSIS_YAW_ID_OFFSET,
+                "chassis yaw CAN ID must follow capacitor");
+  static_assert(RefereeCanCodec::LINK_STATUS_ID_OFFSET < DECISION_ID_OFFSET,
+                "referee link status CAN ID must stay below decision");
 
   static void RxThreadEntry(DualBoard* self) { self->RunRxThread(); }
 
@@ -444,8 +899,8 @@ class DualBoard : public LibXR::Application {
   }
 
   template <typename Data>
-  LibXR::Topic CreateTopic(const char* name) {
-    return LibXR::Topic::CreateTopic<Data>(name, nullptr, true);
+  LibXR::Topic CreateTopic(const char* name, bool multi_publisher = false) {
+    return LibXR::Topic::CreateTopic<Data>(name, nullptr, multi_publisher);
   }
 
   void RegisterRoleTopics() {
@@ -462,7 +917,7 @@ class DualBoard : public LibXR::Application {
       RegisterTopicCallback<LibXR::EulerAngle<float>,
                             &DualBoard::OnLocalAttitude>("gimbal_euler");
 
-      chassis_motion_state_topic_ =
+      state_.chassis_motion_state_topic_ =
           LibXR::Topic(LibXR::Topic::FindOrCreate<ChassisMotionState>(
               CHASSIS_MOTION_STATE_TOPIC_NAME, nullptr,
               CHASSIS_MOTION_STATE_TOPIC_MULTI_PUBLISHER));
@@ -470,19 +925,25 @@ class DualBoard : public LibXR::Application {
       launcher_ref_topic_ = CreateTopic<Referee::LauncherPack>("launcher_ref");
       sentry_ref_topic_ =
           CreateTopic<Referee::RobotGameRefereePack>("sentry_ref");
-      wheel_telemetry_topic_ =
-          CreateTopic<ChassisWheelTelemetry>(wheel_telemetry_topic_name_);
-      chassis_imu_yaw_topic_ = CreateTopic<float>("chassis_imu_yaw");
-      chassis_imu_yaw_valid_topic_ = CreateTopic<bool>("chassis_imu_yaw_valid");
-      chassis_capacitor_capacity_topic_ =
+      state_.chassis_imu_yaw_topic_ = CreateTopic<float>("chassis_imu_yaw");
+      state_.chassis_imu_yaw_valid_topic_ =
+          CreateTopic<bool>("chassis_imu_yaw_valid");
+      state_.chassis_capacitor_capacity_topic_ =
           CreateTopic<uint8_t>("chassis_capacitor_capacity");
-      chassis_capacitor_valid_topic_ =
+      state_.chassis_capacitor_valid_topic_ =
           CreateTopic<bool>("chassis_capacitor_valid");
+      CreateTopic<uint32_t>(Pldx::DualBoardControl::NAV_CHASSIS_MODE_TOPIC);
+      RegisterTopicCallback<uint32_t, &DualBoard::OnNavChassisMode>(
+          Pldx::DualBoardControl::NAV_CHASSIS_MODE_TOPIC);
+      CreateTopic<bool>(Pldx::DualBoardControl::USE_CAPACITOR_TOPIC);
+      RegisterTopicCallback<bool, &DualBoard::OnLocalUseCapacitor>(
+          Pldx::DualBoardControl::USE_CAPACITOR_TOPIC);
     } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
-      chassis_cmd_topic_ = CreateTopic<CMD::ChassisCMD>("chassis_cmd");
-      yaw_angle_topic_ = CreateTopic<float>("yawmotor_angle");
-      pitch_angle_topic_ = CreateTopic<float>("pitchmotor_angle");
-      attitude_topic_ = CreateTopic<LibXR::EulerAngle<float>>("gimbal_euler");
+      state_.chassis_cmd_topic_ = CreateTopic<CMD::ChassisCMD>("chassis_cmd");
+      state_.yaw_angle_topic_ = CreateTopic<float>("yawmotor_angle");
+      state_.pitch_angle_topic_ = CreateTopic<float>("pitchmotor_angle");
+      state_.attitude_topic_ =
+          CreateTopic<LibXR::EulerAngle<float>>("gimbal_euler");
 
       RegisterTopicCallback<Referee::LauncherPack,
                             &DualBoard::OnLocalLauncherFeedback>(
@@ -494,9 +955,8 @@ class DualBoard : public LibXR::Application {
       RegisterTopicCallback<LibXR::EulerAngle<float>,
                             &DualBoard::OnLocalChassisEuler>(
           chassis_euler_topic_name_);
-      RegisterTopicCallback<ChassisWheelTelemetry,
-                            &DualBoard::OnLocalWheelTelemetry>(
-          wheel_telemetry_topic_name_);
+      state_.use_capacitor_topic_ =
+          CreateTopic<bool>(Pldx::DualBoardControl::USE_CAPACITOR_TOPIC);
     }
   }
 
@@ -517,17 +977,38 @@ class DualBoard : public LibXR::Application {
         LibXR::Topic::FindOrCreate<uint8_t>(sentry_state_topic_name_, nullptr));
 
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      RegisterTopicCallback<uint16_t, &DualBoard::OnSentryBuyBullet>(
-          sentry_buy_bullet_num_topic_name_);
-      RegisterTopicCallback<uint8_t, &DualBoard::OnSentryRemoteBuyBullet>(
-          sentry_remote_buy_bullet_times_topic_name_);
-      RegisterTopicCallback<uint8_t, &DualBoard::OnSentryRemoteBuyHp>(
-          sentry_remote_buy_hp_times_topic_name_);
-      RegisterTopicCallback<bool, &DualBoard::OnSentryBuyResurrection>(
-          sentry_buy_resurrection_topic_name_);
-      RegisterTopicCallback<uint8_t, &DualBoard::OnSentryState>(
-          sentry_state_topic_name_);
+      RegisterDecisionQueue(sentry_buy_bullet_num_topic_,
+                            state_.sentry_buy_bullet_updates_);
+      RegisterDecisionQueue(sentry_remote_buy_bullet_times_topic_,
+                            state_.sentry_remote_buy_bullet_updates_);
+      RegisterDecisionQueue(sentry_remote_buy_hp_times_topic_,
+                            state_.sentry_remote_buy_hp_updates_);
+      RegisterDecisionQueue(sentry_buy_resurrection_topic_,
+                            state_.sentry_buy_resurrection_updates_);
+      RegisterDecisionQueue(sentry_state_topic_, state_.sentry_state_updates_);
     }
+  }
+
+  template <typename Data>
+  void RegisterDecisionQueue(LibXR::Topic topic,
+                             LibXR::SPSCQueue<Data>& queue) {
+    auto* subscriber = new LibXR::Topic::QueuedSubscriber(topic, queue);
+    UNUSED(subscriber);
+    struct QueueBind {
+      LibXR::SPSCQueue<Data>* queue_;
+      std::atomic<uint32_t>* drops_;
+    };
+    auto* bind = new QueueBind{&queue, &state_.decision_update_drops_};
+    auto callback = LibXR::Topic::Callback::Create(
+        [](bool in_isr, QueueBind* bind, const Data& data) {
+          UNUSED(in_isr);
+          UNUSED(data);
+          if (bind->queue_->EmptySize() == 0U) {
+            bind->drops_->fetch_add(1U, std::memory_order_relaxed);
+          }
+        },
+        bind);
+    topic.RegisterCallback(callback);
   }
 
   template <typename Data, void (DualBoard::*HANDLER)(const Data&)>
@@ -560,6 +1041,8 @@ class DualBoard : public LibXR::Application {
                                callback);
     dual_board_event_.Register(static_cast<uint32_t>(ChassisMode::FOLLOW),
                                callback);
+    dual_board_event_.Register(static_cast<uint32_t>(ChassisMode::NAVIGATION),
+                               callback);
   }
 
   void RegisterCmdEvent() {
@@ -580,7 +1063,7 @@ class DualBoard : public LibXR::Application {
           [](bool in_isr, DualBoard* self, uint32_t event_id) {
             UNUSED(in_isr);
             UNUSED(event_id);
-            self->SetLocalModeRelax();
+            self->ClearLocalModeRelax();
           },
           this);
 
@@ -604,12 +1087,54 @@ class DualBoard : public LibXR::Application {
     can_->Register(can_rx_callback_, LibXR::CAN::Type::STANDARD,
                    LibXR::CAN::FilterMode::ID_RANGE, rx_id_,
                    rx_id_ + RX_ID_RANGE);
+
+    can_error_callback_ = LibXR::CAN::Callback::Create(
+        [](bool in_isr, DualBoard* self, const LibXR::CAN::ClassicPack& pack) {
+          UNUSED(in_isr);
+          self->OnCanError(pack);
+        },
+        this);
+    can_->Register(can_error_callback_, LibXR::CAN::Type::ERROR);
+  }
+
+  static bool IsCanLinkFault(LibXR::CAN::ErrorID error_id) {
+    return error_id == LibXR::CAN::ErrorID::CAN_ERROR_ID_BUS_OFF ||
+           error_id == LibXR::CAN::ErrorID::CAN_ERROR_ID_ERROR_PASSIVE;
+  }
+
+  void OnCanError(const LibXR::CAN::ClassicPack& pack) {
+    if (pack.type != LibXR::CAN::Type::ERROR ||
+        !LibXR::CAN::IsErrorId(pack.id)) {
+      return;
+    }
+    if (IsCanLinkFault(LibXR::CAN::ToErrorID(pack.id))) {
+      can_bus_fault_.Set();
+    }
+  }
+
+  void RefreshCanErrorState() {
+    LibXR::CAN::ErrorState state{};
+    if (can_->GetErrorState(state) != LibXR::ErrorCode::OK) {
+      return;
+    }
+    if (state.bus_off || state.error_passive) {
+      can_bus_fault_.Set();
+    } else {
+      can_bus_fault_.Clear();
+    }
+  }
+
+  void ClearLatchedBusFaultIfUnobservable() {
+    LibXR::CAN::ErrorState state{};
+    if (can_->GetErrorState(state) != LibXR::ErrorCode::OK) {
+      can_bus_fault_.Clear();
+    }
   }
 
   void OnLocalChassisCommand(const CMD::ChassisCMD& command) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
-      local_chassis_command_ = command;
+      state_.local_chassis_command_ = command;
     } else {
       UNUSED(command);
     }
@@ -618,7 +1143,7 @@ class DualBoard : public LibXR::Application {
   void OnLocalYawAngle(const float& yaw_angle) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
-      local_yaw_angle_ = yaw_angle;
+      state_.local_yaw_angle_ = yaw_angle;
     } else {
       UNUSED(yaw_angle);
     }
@@ -627,7 +1152,7 @@ class DualBoard : public LibXR::Application {
   void OnLocalPitchAngle(const float& pitch_angle) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
-      local_pitch_angle_ = pitch_angle;
+      state_.local_pitch_angle_ = pitch_angle;
     } else {
       UNUSED(pitch_angle);
     }
@@ -636,7 +1161,7 @@ class DualBoard : public LibXR::Application {
   void OnLocalAttitude(const LibXR::EulerAngle<float>& attitude) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
-      local_attitude_ = attitude;
+      state_.local_attitude_ = attitude;
     } else {
       UNUSED(attitude);
     }
@@ -645,8 +1170,8 @@ class DualBoard : public LibXR::Application {
   void OnLocalLauncherFeedback(const Referee::LauncherPack& launcher_pack) {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
-      local_launcher_pack_ = launcher_pack;
-      launcher_feedback_valid_ = true;
+      state_.local_launcher_pack_ = launcher_pack;
+      state_.launcher_feedback_valid_ = true;
     } else {
       UNUSED(launcher_pack);
     }
@@ -655,10 +1180,10 @@ class DualBoard : public LibXR::Application {
   void OnLocalSentryRef(const Referee::RobotGameRefereePack& referee_pack) {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
-      local_sentry_ref_ = referee_pack;
-      pending_referee_sources_ |= SourceMaskForCommand(
+      state_.local_sentry_ref_ = referee_pack;
+      state_.pending_referee_sources_ |= SourceMaskForCommand(
           static_cast<Referee::CommandID>(referee_pack.source_command_id));
-      referee_status_pending_ = true;
+      state_.referee_status_pending_ = true;
     } else {
       UNUSED(referee_pack);
     }
@@ -667,8 +1192,8 @@ class DualBoard : public LibXR::Application {
   void OnLocalChassisGyro(const Eigen::Matrix<float, 3, 1>& gyro) {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
-      local_chassis_gyro_ = gyro;
-      chassis_gyro_received_ = true;
+      state_.local_chassis_gyro_ = gyro;
+      state_.chassis_gyro_received_ = true;
     } else {
       UNUSED(gyro);
     }
@@ -677,103 +1202,64 @@ class DualBoard : public LibXR::Application {
   void OnLocalChassisEuler(const LibXR::EulerAngle<float>& euler) {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
-      local_chassis_yaw_ = euler.Yaw();
-      chassis_yaw_valid_ = std::isfinite(local_chassis_yaw_);
-      local_chassis_yaw_time_ms_ =
+      state_.local_chassis_yaw_ = euler.Yaw();
+      state_.chassis_yaw_valid_ = std::isfinite(state_.local_chassis_yaw_);
+      state_.local_chassis_yaw_time_ms_ =
           static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
     } else {
       UNUSED(euler);
     }
   }
 
-  void OnLocalWheelTelemetry(const ChassisWheelTelemetry& telemetry) {
-    if constexpr (ROLE == DualBoardRole::CHASSIS) {
-      LibXR::Mutex::LockGuard lock(data_mutex_);
-      local_wheel_telemetry_ = telemetry;
-      wheel_telemetry_pending_ = true;
-    } else {
-      UNUSED(telemetry);
-    }
-  }
-
-  void EnqueueDecisionUpdate(DecisionUpdateKind kind, uint16_t value) {
-    const DecisionUpdate update{kind, value};
-    if (decision_updates_.Push(update) != LibXR::ErrorCode::OK) {
-      decision_update_drops_.fetch_add(1U, std::memory_order_relaxed);
-    }
-  }
-
-  void OnSentryBuyBullet(const uint16_t& value) {
+  void OnNavChassisMode(const uint32_t& mode) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      EnqueueDecisionUpdate(DecisionUpdateKind::BUY_BULLET, value);
-    } else {
-      UNUSED(value);
-    }
-  }
-
-  void OnSentryRemoteBuyBullet(const uint8_t& value) {
-    if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      EnqueueDecisionUpdate(DecisionUpdateKind::REMOTE_BUY_BULLET, value);
-    } else {
-      UNUSED(value);
-    }
-  }
-
-  void OnSentryRemoteBuyHp(const uint8_t& value) {
-    if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      EnqueueDecisionUpdate(DecisionUpdateKind::REMOTE_BUY_HP, value);
-    } else {
-      UNUSED(value);
-    }
-  }
-
-  void OnSentryBuyResurrection(const bool& value) {
-    if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      EnqueueDecisionUpdate(DecisionUpdateKind::BUY_RESURRECTION,
-                            value ? 1U : 0U);
-    } else {
-      UNUSED(value);
-    }
-  }
-
-  void OnSentryState(const uint8_t& value) {
-    if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      EnqueueDecisionUpdate(DecisionUpdateKind::STATE, value);
-    } else {
-      UNUSED(value);
-    }
-  }
-
-  void OnLocalModeEvent(uint32_t event_id) {
-    if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      if (!IsSupportedMode(event_id)) {
+      if (!IsSupportedMode(mode)) {
         return;
       }
 
       LibXR::Mutex::LockGuard lock(data_mutex_);
-      local_chassis_mode_ = static_cast<uint8_t>(event_id);
-      local_mode_valid_ = true;
-      uint32_t mode = event_id;
-      mode_topic_.Publish(mode);
-      motion_state_.mode = event_id == static_cast<uint32_t>(ChassisMode::ROTOR)
-                               ? ChassisMotionMode::ROTOR
-                               : ChassisMotionMode::NON_ROTOR;
-      PublishMotionStateLocked();
+      state_.nav_chassis_mode_ = static_cast<uint8_t>(mode);
+      state_.nav_mode_valid_ = true;
     } else {
-      UNUSED(event_id);
+      UNUSED(mode);
+    }
+  }
+
+  void OnLocalUseCapacitor(const bool& enabled) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      state_.local_use_capacitor_ = enabled;
+    } else {
+      UNUSED(enabled);
+    }
+  }
+
+  void OnLocalModeEvent(uint32_t mode) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      if (!IsSupportedMode(mode)) {
+        return;
+      }
+
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      state_.rc_chassis_mode_ = static_cast<uint8_t>(mode);
+    } else {
+      UNUSED(mode);
     }
   }
 
   void SetLocalModeRelax() {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
-      local_chassis_command_ = {};
-      local_chassis_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
-      local_mode_valid_ = true;
-      uint32_t mode = static_cast<uint32_t>(ChassisMode::RELAX);
-      mode_topic_.Publish(mode);
-      motion_state_.mode = ChassisMotionMode::NON_ROTOR;
-      PublishMotionStateLocked();
+      state_.local_chassis_command_ = {};
+      state_.output_relax_ = true;
+      PublishSelectedModeLocked(static_cast<uint8_t>(ChassisMode::RELAX));
+    }
+  }
+
+  void ClearLocalModeRelax() {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      state_.output_relax_ = false;
     }
   }
 
@@ -800,401 +1286,315 @@ class DualBoard : public LibXR::Application {
         SendDecisionFrameIfDue(now_ms);
         ReportDecisionUpdateDrops(now_ms);
         SendGimbalControlFrames(now_ms);
-        ExpireWheelTelemetryAssembly(now_ms);
-        CheckWheelTelemetryWatchdog(now_ms);
         CheckChassisYawWatchdog(now_ms);
         CheckCapacitorWatchdog(now_ms);
-        CheckOffline(now_ms);
       } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
         SendMotionFrameIfDue(now_ms);
         SendChassisYawFrameIfDue(now_ms);
         SendCapacitorFrameIfDue(now_ms);
-        SendWheelTelemetryIfPending();
         SendLauncherFeedbackFrameIfDue(now_ms);
         SendRefereeFramesIfDue(now_ms);
-        CheckOffline(now_ms);
       }
 
+      CheckOffline(now_ms);
       protocol_thread_.SleepUntil(last_time, PROTOCOL_THREAD_PERIOD_MS);
     }
   }
 
   void DrainDecisionUpdates() {
-    if constexpr (ROLE != DualBoardRole::GIMBAL) {
-      return;
-    }
-
-    DecisionUpdate update{};
-    for (size_t processed = 0U; processed < DECISION_UPDATE_QUEUE_CAPACITY;
-         ++processed) {
-      if (decision_updates_.Pop(update) != LibXR::ErrorCode::OK) {
-        break;
-      }
-      switch (update.kind) {
-        case DecisionUpdateKind::BUY_BULLET: {
-          const uint32_t TOTAL =
-              pending_decision_.buy_bullet_delta + update.value;
-          pending_decision_.buy_bullet_delta =
-              static_cast<uint16_t>(std::min(TOTAL, 2047U));
-          pending_decision_.valid_mask |= SentryDecision::BUY_BULLET_VALID;
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      for (size_t processed = 0U; processed < DECISION_UPDATE_QUEUE_CAPACITY;) {
+        const size_t BEFORE = processed;
+        uint16_t buy_bullet = 0U;
+        if (processed < DECISION_UPDATE_QUEUE_CAPACITY &&
+            state_.sentry_buy_bullet_updates_.Pop(buy_bullet) ==
+                LibXR::ErrorCode::OK) {
+          SentryDecision::accumulate(state_.pending_decision_,
+                                     SentryDecision::UpdateKind::BUY_BULLET,
+                                     buy_bullet);
+          ++processed;
+        }
+        uint8_t remote_bullet = 0U;
+        if (processed < DECISION_UPDATE_QUEUE_CAPACITY &&
+            state_.sentry_remote_buy_bullet_updates_.Pop(remote_bullet) ==
+                LibXR::ErrorCode::OK) {
+          SentryDecision::accumulate(
+              state_.pending_decision_,
+              SentryDecision::UpdateKind::REMOTE_BUY_BULLET, remote_bullet);
+          ++processed;
+        }
+        uint8_t remote_hp = 0U;
+        if (processed < DECISION_UPDATE_QUEUE_CAPACITY &&
+            state_.sentry_remote_buy_hp_updates_.Pop(remote_hp) ==
+                LibXR::ErrorCode::OK) {
+          SentryDecision::accumulate(state_.pending_decision_,
+                                     SentryDecision::UpdateKind::REMOTE_BUY_HP,
+                                     remote_hp);
+          ++processed;
+        }
+        bool buy_resurrection = false;
+        if (processed < DECISION_UPDATE_QUEUE_CAPACITY &&
+            state_.sentry_buy_resurrection_updates_.Pop(buy_resurrection) ==
+                LibXR::ErrorCode::OK) {
+          SentryDecision::accumulate(
+              state_.pending_decision_,
+              SentryDecision::UpdateKind::BUY_RESURRECTION,
+              buy_resurrection ? 1U : 0U);
+          ++processed;
+        }
+        uint8_t state = 0U;
+        if (processed < DECISION_UPDATE_QUEUE_CAPACITY &&
+            state_.sentry_state_updates_.Pop(state) == LibXR::ErrorCode::OK) {
+          SentryDecision::accumulate(state_.pending_decision_,
+                                     SentryDecision::UpdateKind::STATE, state);
+          ++processed;
+        }
+        if (processed == BEFORE) {
           break;
         }
-        case DecisionUpdateKind::REMOTE_BUY_BULLET: {
-          const uint8_t BULLET_COUNT = static_cast<uint8_t>(
-              std::min<uint16_t>(SentryDecision::RemoteBulletCount(
-                                     pending_decision_.remote_request_counts) +
-                                     update.value,
-                                 15U));
-          const uint8_t HP_COUNT = SentryDecision::RemoteHpCount(
-              pending_decision_.remote_request_counts);
-          pending_decision_.remote_request_counts =
-              SentryDecision::PackRemoteCounts(BULLET_COUNT, HP_COUNT);
-          pending_decision_.valid_mask |= SentryDecision::REMOTE_BULLET_VALID;
-          break;
-        }
-        case DecisionUpdateKind::REMOTE_BUY_HP: {
-          const uint8_t BULLET_COUNT = SentryDecision::RemoteBulletCount(
-              pending_decision_.remote_request_counts);
-          const uint8_t HP_COUNT = static_cast<uint8_t>(
-              std::min<uint16_t>(SentryDecision::RemoteHpCount(
-                                     pending_decision_.remote_request_counts) +
-                                     update.value,
-                                 15U));
-          pending_decision_.remote_request_counts =
-              SentryDecision::PackRemoteCounts(BULLET_COUNT, HP_COUNT);
-          pending_decision_.valid_mask |= SentryDecision::REMOTE_HP_VALID;
-          break;
-        }
-        case DecisionUpdateKind::BUY_RESURRECTION:
-          if (update.value != 0U) {
-            pending_decision_.flags |= SentryDecision::BUY_RESURRECTION_FLAG;
-          } else {
-            pending_decision_.flags &=
-                static_cast<uint8_t>(~SentryDecision::BUY_RESURRECTION_FLAG);
-          }
-          pending_decision_.valid_mask |=
-              SentryDecision::BUY_RESURRECTION_VALID;
-          break;
-        case DecisionUpdateKind::STATE:
-          pending_decision_.state = static_cast<uint8_t>(update.value);
-          pending_decision_.valid_mask |= SentryDecision::STATE_VALID;
-          break;
       }
     }
   }
 
   void SendDecisionFrameIfDue(uint32_t now_ms) {
-    if constexpr (ROLE != DualBoardRole::GIMBAL) {
-      UNUSED(now_ms);
-      return;
-    }
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      if (!state_.decision_retry_.Active() &&
+          state_.pending_decision_.valid_mask != 0U) {
+        const bool STARTED = state_.decision_retry_.Begin(
+            state_.pending_decision_, ++state_.decision_sequence_, now_ms);
+        ASSERT(STARTED);
+        state_.pending_decision_ = {};
+        state_.pending_decision_.version = SentryDecision::VERSION;
+      }
 
-    if (!decision_retry_.Active() && pending_decision_.valid_mask != 0U) {
-      active_decision_ = pending_decision_;
-      pending_decision_ = {};
-      pending_decision_.version = SentryDecision::VERSION;
-      active_decision_.sequence = ++decision_sequence_;
-      const bool STARTED = decision_retry_.Begin(
-          active_decision_, active_decision_.sequence, now_ms);
-      ASSERT(STARTED);
-    }
+      if (!state_.decision_retry_.Due(now_ms)) {
+        return;
+      }
 
-    if (!decision_retry_.Due(now_ms)) {
-      return;
+      const bool SENT = SendClassicFrame(tx_id_ + DECISION_ID_OFFSET,
+                                         state_.decision_retry_.Frame());
+      state_.decision_retry_.OnSendResult(SENT, now_ms);
     }
-
-    const bool SENT =
-        SendClassicFrame(tx_id_ + DECISION_ID_OFFSET, active_decision_);
-    decision_retry_.OnSendResult(SENT, now_ms);
   }
 
   void ReportDecisionUpdateDrops(uint32_t now_ms) {
-    if constexpr (ROLE != DualBoardRole::GIMBAL) {
-      UNUSED(now_ms);
-      return;
-    }
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      const uint32_t DROPS =
+          state_.decision_update_drops_.load(std::memory_order_relaxed);
+      if (DROPS == state_.reported_decision_update_drops_) {
+        return;
+      }
+      if (state_.decision_drop_log_started_ &&
+          now_ms - state_.last_decision_drop_log_ms_ <
+              DECISION_DROP_LOG_PERIOD_MS) {
+        return;
+      }
 
-    const uint32_t DROPS =
-        decision_update_drops_.load(std::memory_order_relaxed);
-    if (DROPS == reported_decision_update_drops_) {
-      return;
+      XR_LOG_WARN("DualBoard decision update queue dropped {} items", DROPS);
+      state_.reported_decision_update_drops_ = DROPS;
+      state_.last_decision_drop_log_ms_ = now_ms;
+      state_.decision_drop_log_started_ = true;
     }
-    if (decision_drop_log_started_ &&
-        now_ms - last_decision_drop_log_ms_ < DECISION_DROP_LOG_PERIOD_MS) {
-      return;
-    }
-
-    XR_LOG_WARN("DualBoard decision update queue dropped {} items", DROPS);
-    reported_decision_update_drops_ = DROPS;
-    last_decision_drop_log_ms_ = now_ms;
-    decision_drop_log_started_ = true;
   }
 
   void SendMotionFrameIfDue(uint32_t now_ms) {
-    if (!IsDue(now_ms, next_control_tx_ms_, CONTROL_PERIOD_MS)) {
-      return;
-    }
-
-    Eigen::Matrix<float, 3, 1> gyro{};
-    bool gyro_received = false;
-    {
-      LibXR::Mutex::LockGuard lock(data_mutex_);
-      gyro = local_chassis_gyro_;
-      gyro_received = chassis_gyro_received_;
-    }
-
-    MotionFrame frame{};
-    float gyro_z = 0.0f;
-    if (gyro_received) {
-      gyro_z = gyro.z();
-    }
-    if (gyro_received && std::isfinite(gyro_z)) {
-      float gyro_z_q = gyro_z * GYRO_SCALE;
-      if (gyro_z_q >= static_cast<float>(std::numeric_limits<int16_t>::min()) &&
-          gyro_z_q <= static_cast<float>(std::numeric_limits<int16_t>::max())) {
-        frame.gyro_z_q = static_cast<int16_t>(gyro_z_q);
-        frame.gyro_valid = 1U;
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      if (!IsDue(now_ms, next_control_tx_ms_, CONTROL_PERIOD_MS)) {
+        return;
       }
-    }
 
-    SendClassicFrame(tx_id_ + ANGLE_ID_OFFSET, frame);
+      Eigen::Matrix<float, 3, 1> gyro{};
+      bool gyro_received = false;
+      {
+        LibXR::Mutex::LockGuard lock(data_mutex_);
+        gyro = state_.local_chassis_gyro_;
+        gyro_received = state_.chassis_gyro_received_;
+      }
+
+      MotionFrame frame{};
+      float gyro_z = 0.0f;
+      if (gyro_received) {
+        gyro_z = gyro.z();
+      }
+      if (gyro_received && std::isfinite(gyro_z)) {
+        float gyro_z_q = gyro_z * GYRO_SCALE;
+        if (gyro_z_q >=
+                static_cast<float>(std::numeric_limits<int16_t>::min()) &&
+            gyro_z_q <=
+                static_cast<float>(std::numeric_limits<int16_t>::max())) {
+          frame.gyro_z_q = static_cast<int16_t>(gyro_z_q);
+          frame.gyro_valid = 1U;
+        }
+      }
+
+      SendClassicFrame(tx_id_ + ANGLE_ID_OFFSET, frame);
+    }
   }
 
   void SendChassisYawFrameIfDue(uint32_t now_ms) {
-    if constexpr (ROLE != DualBoardRole::CHASSIS) {
-      UNUSED(now_ms);
-      return;
-    }
-    if (!IsDue(now_ms, next_chassis_yaw_tx_ms_, CONTROL_PERIOD_MS)) {
-      return;
-    }
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      if (!IsDue(now_ms, state_.next_chassis_yaw_tx_ms_, CONTROL_PERIOD_MS)) {
+        return;
+      }
 
-    float yaw = 0.0F;
-    bool valid = false;
-    uint32_t chassis_yaw_time_ms = 0U;
-    {
-      LibXR::Mutex::LockGuard lock(data_mutex_);
-      yaw = local_chassis_yaw_;
-      valid = chassis_yaw_valid_;
-      chassis_yaw_time_ms = local_chassis_yaw_time_ms_;
-    }
+      float yaw = 0.0F;
+      bool valid = false;
+      uint32_t chassis_yaw_time_ms = 0U;
+      {
+        LibXR::Mutex::LockGuard lock(data_mutex_);
+        yaw = state_.local_chassis_yaw_;
+        valid = state_.chassis_yaw_valid_;
+        chassis_yaw_time_ms = state_.local_chassis_yaw_time_ms_;
+      }
 
-    ChassisYawFrame frame{};
-    frame.valid = valid && std::isfinite(yaw) &&
-                          now_ms - chassis_yaw_time_ms <= CHASSIS_YAW_TIMEOUT_MS
-                      ? 1U
-                      : 0U;
-    if (frame.valid != 0U) {
-      yaw = std::clamp(yaw, -3.2F, 3.2F);
-      frame.yaw_q = static_cast<int16_t>(std::lround(yaw * ANGLE_SCALE));
+      ChassisYawFrame frame{};
+      frame.valid =
+          valid && std::isfinite(yaw) &&
+                  now_ms - chassis_yaw_time_ms <= CHASSIS_YAW_TIMEOUT_MS
+              ? 1U
+              : 0U;
+      if (frame.valid != 0U) {
+        yaw = std::clamp(yaw, -3.2F, 3.2F);
+        frame.yaw_q = static_cast<int16_t>(std::lround(yaw * ANGLE_SCALE));
+      }
+      frame.sequence = state_.chassis_yaw_sequence_++;
+      frame.sample_time_ms = now_ms;
+      SendClassicFrame(tx_id_ + CHASSIS_YAW_ID_OFFSET, frame);
     }
-    frame.sequence = chassis_yaw_sequence_++;
-    frame.sample_time_ms = now_ms;
-    SendClassicFrame(tx_id_ + CHASSIS_YAW_ID_OFFSET, frame);
   }
 
   void SendCapacitorFrameIfDue(uint32_t now_ms) {
-    if constexpr (ROLE != DualBoardRole::CHASSIS) {
-      UNUSED(now_ms);
-      return;
-    }
-    if (!IsDue(now_ms, next_capacitor_tx_ms_, CONTROL_PERIOD_MS)) {
-      return;
-    }
-
-    CapacitorFrame frame{};
-    if (power_control_ != nullptr) {
-      const PowerControlData DATA = power_control_->GetPowerControlData();
-      const bool VALID =
-          DATA.supercap_online && std::isfinite(DATA.cap_energy_normalized);
-      frame.valid = VALID ? 1U : 0U;
-      if (VALID) {
-        frame.capacity_percent = static_cast<uint8_t>(std::lround(
-            std::clamp(DATA.cap_energy_normalized, 0.0F, 1.0F) * 100.0F));
-      }
-    }
-    frame.sequence = capacitor_sequence_++;
-    frame.sample_time_ms = now_ms;
-    SendClassicFrame(tx_id_ + CAPACITOR_ID_OFFSET, frame);
-  }
-
-  static int16_t EncodeWheelVelocity(float value, uint8_t& status) {
-    const float SCALED = value * WHEEL_Q_SCALE;
-    if (!std::isfinite(SCALED) ||
-        SCALED > static_cast<float>(std::numeric_limits<int16_t>::max())) {
-      status |= ChassisWheelTelemetry::ENCODING_SATURATED;
-      status &= static_cast<uint8_t>(~ChassisWheelTelemetry::FRESH);
-      return std::numeric_limits<int16_t>::max();
-    }
-    if (SCALED < static_cast<float>(std::numeric_limits<int16_t>::min())) {
-      status |= ChassisWheelTelemetry::ENCODING_SATURATED;
-      status &= static_cast<uint8_t>(~ChassisWheelTelemetry::FRESH);
-      return std::numeric_limits<int16_t>::min();
-    }
-    return static_cast<int16_t>(std::lround(SCALED));
-  }
-
-  static bool EncodeDiagnostic(float value, float scale, int16_t& output) {
-    const float SCALED = value * scale;
-    if (!std::isfinite(SCALED) ||
-        SCALED < static_cast<float>(std::numeric_limits<int16_t>::min()) ||
-        SCALED > static_cast<float>(std::numeric_limits<int16_t>::max())) {
-      output = 0;
-      return false;
-    }
-    output = static_cast<int16_t>(std::lround(SCALED));
-    return true;
-  }
-
-  void SendWheelTelemetryIfPending() {
-    if constexpr (ROLE != DualBoardRole::CHASSIS) {
-      return;
-    }
-
-    ChassisWheelTelemetry telemetry{};
-    {
-      LibXR::Mutex::LockGuard lock(data_mutex_);
-      if (!wheel_telemetry_pending_) {
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      if (!IsDue(now_ms, state_.next_capacitor_tx_ms_, CONTROL_PERIOD_MS)) {
         return;
       }
-      telemetry = local_wheel_telemetry_;
-      wheel_telemetry_pending_ = false;
+
+      CapacitorFrame frame{};
+      if (power_control_ != nullptr) {
+        const PowerControlData DATA = power_control_->GetPowerControlData();
+        const bool VALID =
+            DATA.supercap_online && std::isfinite(DATA.cap_energy_normalized);
+        frame.valid = VALID ? 1U : 0U;
+        if (VALID) {
+          frame.capacity_percent = static_cast<uint8_t>(std::lround(
+              std::clamp(DATA.cap_energy_normalized, 0.0F, 1.0F) * 100.0F));
+        }
+      }
+      frame.sequence = state_.capacitor_sequence_++;
+      frame.sample_time_ms = now_ms;
+      SendClassicFrame(tx_id_ + CAPACITOR_ID_OFFSET, frame);
     }
-
-    WheelTelemetryPairFrame pair01{};
-    WheelTelemetryPairFrame pair23{};
-    pair01.sequence = telemetry.sequence;
-    pair23.sequence = telemetry.sequence;
-    pair01.first_status = telemetry.wheel_status[0];
-    pair01.second_status = telemetry.wheel_status[1];
-    pair23.first_status = telemetry.wheel_status[2];
-    pair23.second_status = telemetry.wheel_status[3];
-    pair01.first_wheel_q = EncodeWheelVelocity(
-        telemetry.wheel_angular_velocity[0], pair01.first_status);
-    pair01.second_wheel_q = EncodeWheelVelocity(
-        telemetry.wheel_angular_velocity[1], pair01.second_status);
-    pair23.first_wheel_q = EncodeWheelVelocity(
-        telemetry.wheel_angular_velocity[2], pair23.first_status);
-    pair23.second_wheel_q = EncodeWheelVelocity(
-        telemetry.wheel_angular_velocity[3], pair23.second_status);
-
-    const bool SATURATED = ((pair01.first_status | pair01.second_status |
-                             pair23.first_status | pair23.second_status) &
-                            ChassisWheelTelemetry::ENCODING_SATURATED) != 0U;
-    if (SATURATED) {
-      telemetry.global_status |= ChassisWheelTelemetry::STALE;
-    }
-
-    WheelTelemetryMetaFrame meta{
-        WHEEL_TELEMETRY_VERSION, telemetry.sequence,
-        static_cast<uint32_t>(telemetry.sample_time_us & 0xFFFFFFFFU),
-        telemetry.global_status};
-    WheelTelemetryDiagnosticFrame diagnostic{};
-    diagnostic.sequence = telemetry.sequence;
-    const bool DIAGNOSTIC_VALID =
-        EncodeDiagnostic(telemetry.vx, DIAGNOSTIC_LINEAR_SCALE,
-                         diagnostic.vx_mm_s) &&
-        EncodeDiagnostic(telemetry.vy, DIAGNOSTIC_LINEAR_SCALE,
-                         diagnostic.vy_mm_s) &&
-        EncodeDiagnostic(telemetry.wz, DIAGNOSTIC_ANGULAR_SCALE,
-                         diagnostic.wz_mrad_s);
-    if (!DIAGNOSTIC_VALID) {
-      meta.global_status &=
-          static_cast<uint8_t>(~ChassisWheelTelemetry::DIAGNOSTIC_VALID);
-    }
-
-    SendClassicFrame(tx_id_ + WHEEL_TELEMETRY_META_ID_OFFSET, meta);
-    SendClassicFrame(tx_id_ + WHEEL_TELEMETRY_PAIR01_ID_OFFSET, pair01);
-    SendClassicFrame(tx_id_ + WHEEL_TELEMETRY_DIAGNOSTIC_ID_OFFSET, diagnostic);
-    SendClassicFrame(tx_id_ + WHEEL_TELEMETRY_PAIR23_ID_OFFSET, pair23);
   }
 
   void SendGimbalControlFrames(uint32_t now_ms) {
-    if (!IsDue(now_ms, next_control_tx_ms_, CONTROL_PERIOD_MS)) {
-      return;
-    }
-
-    CMD::ChassisCMD command{};
-    float yaw_angle = 0.0f;
-    float pitch_angle = 0.0f;
-    LibXR::EulerAngle<float> attitude{};
-    uint8_t mode = static_cast<uint8_t>(ChassisMode::RELAX);
-
-    {
-      LibXR::Mutex::LockGuard lock(data_mutex_);
-      command = local_chassis_command_;
-      yaw_angle = local_yaw_angle_;
-      pitch_angle = local_pitch_angle_;
-      attitude = local_attitude_;
-      if (local_mode_valid_) {
-        mode = local_chassis_mode_;
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      if (!IsDue(now_ms, next_control_tx_ms_, CONTROL_PERIOD_MS)) {
+        return;
       }
+
+      CMD::ChassisCMD command{};
+      float yaw_angle = 0.0f;
+      float pitch_angle = 0.0f;
+      LibXR::EulerAngle<float> attitude{};
+      bool use_capacitor = true;
+      Pldx::DualBoardControl::Mode selected_mode =
+          Pldx::DualBoardControl::Mode::RELAX;
+
+      {
+        LibXR::Mutex::LockGuard lock(data_mutex_);
+        command = state_.local_chassis_command_;
+        yaw_angle = state_.local_yaw_angle_;
+        pitch_angle = state_.local_pitch_angle_;
+        attitude = state_.local_attitude_;
+        use_capacitor = state_.local_use_capacitor_;
+        const bool AUTO_CTRL =
+            cmd_ != nullptr && cmd_->GetCtrlMode() == CMD::Mode::CMD_AUTO_CTRL;
+        const bool RC_LOST =
+            state_.output_relax_ || (cmd_ != nullptr && !cmd_->Online());
+        selected_mode = Pldx::DualBoardControl::SelectOutputMode(
+            static_cast<Pldx::DualBoardControl::Mode>(state_.rc_chassis_mode_),
+            state_.nav_mode_valid_,
+            static_cast<Pldx::DualBoardControl::Mode>(state_.nav_chassis_mode_),
+            AUTO_CTRL, RC_LOST);
+        if (RC_LOST) {
+          command = {};
+        }
+        PublishSelectedModeLocked(static_cast<uint8_t>(selected_mode));
+      }
+
+      Pldx::DualBoardControl::Command wire_command{};
+      wire_command.source =
+          command.source == CMD::ChassisCommandSource::NAVIGATION
+              ? Pldx::DualBoardControl::Source::NAVIGATION
+              : Pldx::DualBoardControl::Source::OPERATOR;
+      wire_command.operator_input = {command.operator_input.x,
+                                     command.operator_input.y,
+                                     command.operator_input.z};
+      wire_command.navigation_velocity = {command.navigation_velocity.vx_mps,
+                                          command.navigation_velocity.vy_mps,
+                                          command.navigation_velocity.wz_rad_s};
+      wire_command.self_define = static_cast<int8_t>(command.self_define);
+      wire_command.mode = selected_mode;
+      ControlFrame control_frame{};
+      static_cast<void>(
+          Pldx::DualBoardControl::Encode(wire_command, control_frame));
+
+      AngleFrame angle_frame{};
+      angle_frame.yaw = EncodeSigned(yaw_angle, ANGLE_SCALE, ANGLE_LIMIT);
+      angle_frame.pitch = EncodeSigned(pitch_angle, ANGLE_SCALE, ANGLE_LIMIT);
+      angle_frame.sequence = state_.tx_sequence_++;
+
+      AttitudeFrame attitude_frame{};
+      attitude_frame.roll =
+          EncodeSigned(attitude.Roll(), ANGLE_SCALE, ANGLE_LIMIT);
+      attitude_frame.pitch =
+          EncodeSigned(attitude.Pitch(), ANGLE_SCALE, ANGLE_LIMIT);
+      attitude_frame.yaw =
+          EncodeSigned(attitude.Yaw(), ANGLE_SCALE, ANGLE_LIMIT);
+      attitude_frame.sequence = angle_frame.sequence;
+
+      Pldx::DualBoardControl::UseCapacitorCommand use_capacitor_frame{};
+      static_cast<void>(Pldx::DualBoardControl::EncodeUseCapacitor(
+          use_capacitor, state_.use_capacitor_sequence_++,
+          use_capacitor_frame));
+
+      SendClassicFrame(tx_id_ + CONTROL_ID_OFFSET, control_frame);
+      SendClassicFrame(tx_id_ + ANGLE_ID_OFFSET, angle_frame);
+      SendClassicFrame(tx_id_ + ATTITUDE_ID_OFFSET, attitude_frame);
+      SendClassicFrame(tx_id_ + USE_CAPACITOR_ID_OFFSET, use_capacitor_frame);
     }
-
-    Pldx::DualBoardControl::Command wire_command{};
-    wire_command.x = command.x;
-    wire_command.y = command.y;
-    wire_command.z = command.z;
-    wire_command.self_define = static_cast<int8_t>(command.self_define);
-    wire_command.mode = static_cast<Pldx::DualBoardControl::Mode>(mode);
-    wire_command.si_units = command.si_units;
-    wire_command.force_x_global_n = command.force_x_global_n;
-    wire_command.force_y_global_n = command.force_y_global_n;
-    wire_command.torque_z_global_nm = command.torque_z_global_nm;
-    wire_command.force_control = command.force_control;
-    ControlFrame control_frame{};
-    static_cast<void>(
-        Pldx::DualBoardControl::Encode(wire_command, control_frame));
-    ForceFrame force_frame{};
-    static_cast<void>(Pldx::DualBoardControl::EncodeForce(
-        wire_command, force_frame, force_sequence_++));
-
-    AngleFrame angle_frame{};
-    angle_frame.yaw = EncodeSigned(yaw_angle, ANGLE_SCALE, ANGLE_LIMIT);
-    angle_frame.pitch = EncodeSigned(pitch_angle, ANGLE_SCALE, ANGLE_LIMIT);
-    angle_frame.sequence = tx_sequence_++;
-
-    AttitudeFrame attitude_frame{};
-    attitude_frame.roll =
-        EncodeSigned(attitude.Roll(), ANGLE_SCALE, ANGLE_LIMIT);
-    attitude_frame.pitch =
-        EncodeSigned(attitude.Pitch(), ANGLE_SCALE, ANGLE_LIMIT);
-    attitude_frame.yaw = EncodeSigned(attitude.Yaw(), ANGLE_SCALE, ANGLE_LIMIT);
-    attitude_frame.sequence = angle_frame.sequence;
-
-    SendClassicFrame(tx_id_ + CONTROL_ID_OFFSET, control_frame);
-    SendClassicFrame(tx_id_ + FORCE_ID_OFFSET, force_frame);
-    SendClassicFrame(tx_id_ + ANGLE_ID_OFFSET, angle_frame);
-    SendClassicFrame(tx_id_ + ATTITUDE_ID_OFFSET, attitude_frame);
   }
 
   void SendLauncherFeedbackFrameIfDue(uint32_t now_ms) {
-    if (!IsDue(now_ms, next_launcher_feedback_tx_ms_,
-               LAUNCHER_FEEDBACK_PERIOD_MS)) {
-      return;
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      if (!IsDue(now_ms, state_.next_launcher_feedback_tx_ms_,
+                 LAUNCHER_FEEDBACK_PERIOD_MS)) {
+        return;
+      }
+
+      Referee::LauncherPack launcher_pack{};
+      bool valid = false;
+      {
+        LibXR::Mutex::LockGuard lock(data_mutex_);
+        launcher_pack = state_.local_launcher_pack_;
+        valid = state_.launcher_feedback_valid_;
+      }
+
+      if (!valid) {
+        return;
+      }
+
+      LauncherFeedbackFrame frame{};
+      frame.heat_limit = launcher_pack.rs.shooter_heat_limit;
+      frame.cooling_rate = launcher_pack.rs.shooter_cooling_value;
+      frame.heat = launcher_pack.ph.launcher_id1_17_heat;
+      frame.bullet_speed_deci =
+          EncodeUnsigned8(launcher_pack.ld.bullet_speed, BULLET_SPEED_SCALE,
+                          BULLET_SPEED_LIMIT);
+      frame.robot_level = launcher_pack.rs.robot_level;
+
+      SendClassicFrame(tx_id_ + CONTROL_ID_OFFSET, frame);
     }
-
-    Referee::LauncherPack launcher_pack{};
-    bool valid = false;
-    {
-      LibXR::Mutex::LockGuard lock(data_mutex_);
-      launcher_pack = local_launcher_pack_;
-      valid = launcher_feedback_valid_;
-    }
-
-    if (!valid) {
-      return;
-    }
-
-    LauncherFeedbackFrame frame{};
-    frame.heat_limit = launcher_pack.rs.shooter_heat_limit;
-    frame.cooling_rate = launcher_pack.rs.shooter_cooling_value;
-    frame.heat = launcher_pack.ph.launcher_id1_17_heat;
-    frame.bullet_speed_deci = EncodeUnsigned8(
-        launcher_pack.ld.bullet_speed, BULLET_SPEED_SCALE, BULLET_SPEED_LIMIT);
-    frame.robot_level = launcher_pack.rs.robot_level;
-
-    SendClassicFrame(tx_id_ + CONTROL_ID_OFFSET, frame);
   }
 
   template <typename Data>
@@ -1207,76 +1607,81 @@ class DualBoard : public LibXR::Application {
   }
 
   void SendRefereeFramesIfDue(uint32_t now_ms) {
-    if constexpr (ROLE != DualBoardRole::CHASSIS) {
-      UNUSED(now_ms);
-      return;
-    }
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      Referee::RobotGameRefereePack referee_pack{};
+      uint16_t pending_sources = 0U;
+      bool status_pending = false;
+      {
+        LibXR::Mutex::LockGuard lock(data_mutex_);
+        referee_pack = state_.local_sentry_ref_;
+        pending_sources = state_.pending_referee_sources_;
+        state_.pending_referee_sources_ = 0U;
+        status_pending = state_.referee_status_pending_;
+        state_.referee_status_pending_ = false;
+      }
 
-    Referee::RobotGameRefereePack referee_pack{};
-    uint16_t pending_sources = 0U;
-    bool status_pending = false;
-    {
-      LibXR::Mutex::LockGuard lock(data_mutex_);
-      referee_pack = local_sentry_ref_;
-      pending_sources = pending_referee_sources_;
-      pending_referee_sources_ = 0U;
-      status_pending = referee_status_pending_;
-      referee_status_pending_ = false;
-    }
+      if ((pending_sources & Referee::SOURCE_GAME_STATUS) != 0U) {
+        RefereeGameStatusData data{referee_pack.game_status.game_type,
+                                   referee_pack.game_status.game_progress,
+                                   referee_pack.game_status.stage_remain_time};
+        SendRefereeFragments(REFEREE_GAME_STATUS_ID_OFFSET,
+                             state_.referee_sequences_[0]++, data);
+      }
+      if ((pending_sources & Referee::SOURCE_ROBOT_HP) != 0U) {
+        SendRefereeFragments(REFEREE_ROBOT_HP_ID_OFFSET,
+                             state_.referee_sequences_[1]++,
+                             referee_pack.robot_hp);
+      }
+      if ((pending_sources & Referee::SOURCE_FIELD_EVENT) != 0U) {
+        SendRefereeFragments(REFEREE_FIELD_EVENT_ID_OFFSET,
+                             state_.referee_sequences_[2]++,
+                             referee_pack.field_event);
+      }
+      if ((pending_sources & Referee::SOURCE_ROBOT_STATUS) != 0U) {
+        SendRefereeFragments(REFEREE_ROBOT_STATUS_ID_OFFSET,
+                             state_.referee_sequences_[3]++,
+                             referee_pack.robot_status);
+      }
+      if ((pending_sources & Referee::SOURCE_POWER_HEAT) != 0U) {
+        SendRefereeFragments(REFEREE_POWER_HEAT_ID_OFFSET,
+                             state_.referee_sequences_[4]++,
+                             referee_pack.power_heat);
+      }
+      if ((pending_sources & Referee::SOURCE_SENTRY_POS) != 0U) {
+        SendRefereeFragments(REFEREE_ROBOT_POS_ID_OFFSET,
+                             state_.referee_sequences_[10]++,
+                             referee_pack.sentry_pos);
+      }
+      if ((pending_sources & Referee::SOURCE_ROBOT_BUFF) != 0U) {
+        SendRefereeFragments(REFEREE_ROBOT_BUFF_ID_OFFSET,
+                             state_.referee_sequences_[6]++,
+                             referee_pack.robot_buff);
+      }
+      if ((pending_sources & Referee::SOURCE_ROBOT_DAMAGE) != 0U) {
+        SendRefereeFragments(REFEREE_ROBOT_DAMAGE_ID_OFFSET,
+                             state_.referee_sequences_[7]++,
+                             referee_pack.robot_damage);
+      }
+      if ((pending_sources & Referee::SOURCE_BULLET_REMAIN) != 0U) {
+        SendRefereeFragments(REFEREE_BULLET_REMAIN_ID_OFFSET,
+                             state_.referee_sequences_[8]++,
+                             referee_pack.bullet_remain);
+      }
+      if ((pending_sources & Referee::SOURCE_RFID) != 0U) {
+        SendRefereeFragments(REFEREE_RFID_ID_OFFSET,
+                             state_.referee_sequences_[9]++, referee_pack.rfid);
+      }
 
-    if ((pending_sources & Referee::SOURCE_GAME_STATUS) != 0U) {
-      RefereeGameStatusData data{referee_pack.game_status.game_type,
-                                 referee_pack.game_status.game_progress,
-                                 referee_pack.game_status.stage_remain_time};
-      SendRefereeFragments(REFEREE_GAME_STATUS_ID_OFFSET,
-                           referee_sequences_[0]++, data);
-    }
-    if ((pending_sources & Referee::SOURCE_ROBOT_HP) != 0U) {
-      SendRefereeFragments(REFEREE_ROBOT_HP_ID_OFFSET, referee_sequences_[1]++,
-                           referee_pack.robot_hp);
-    }
-    if ((pending_sources & Referee::SOURCE_FIELD_EVENT) != 0U) {
-      SendRefereeFragments(REFEREE_FIELD_EVENT_ID_OFFSET,
-                           referee_sequences_[2]++, referee_pack.field_event);
-    }
-    if ((pending_sources & Referee::SOURCE_ROBOT_STATUS) != 0U) {
-      SendRefereeFragments(REFEREE_ROBOT_STATUS_ID_OFFSET,
-                           referee_sequences_[3]++, referee_pack.robot_status);
-    }
-    if ((pending_sources & Referee::SOURCE_POWER_HEAT) != 0U) {
-      SendRefereeFragments(REFEREE_POWER_HEAT_ID_OFFSET,
-                           referee_sequences_[4]++, referee_pack.power_heat);
-    }
-    if ((pending_sources & Referee::SOURCE_SENTRY_POS) != 0U) {
-      SendRefereeFragments(REFEREE_ROBOT_POS_ID_OFFSET,
-                           referee_sequences_[10]++, referee_pack.sentry_pos);
-    }
-    if ((pending_sources & Referee::SOURCE_ROBOT_BUFF) != 0U) {
-      SendRefereeFragments(REFEREE_ROBOT_BUFF_ID_OFFSET,
-                           referee_sequences_[6]++, referee_pack.robot_buff);
-    }
-    if ((pending_sources & Referee::SOURCE_ROBOT_DAMAGE) != 0U) {
-      SendRefereeFragments(REFEREE_ROBOT_DAMAGE_ID_OFFSET,
-                           referee_sequences_[7]++, referee_pack.robot_damage);
-    }
-    if ((pending_sources & Referee::SOURCE_BULLET_REMAIN) != 0U) {
-      SendRefereeFragments(REFEREE_BULLET_REMAIN_ID_OFFSET,
-                           referee_sequences_[8]++, referee_pack.bullet_remain);
-    }
-    if ((pending_sources & Referee::SOURCE_RFID) != 0U) {
-      SendRefereeFragments(REFEREE_RFID_ID_OFFSET, referee_sequences_[9]++,
-                           referee_pack.rfid);
-    }
-
-    const bool STATUS_DUE =
-        IsDue(now_ms, next_referee_status_tx_ms_, REFEREE_STATUS_PERIOD_MS);
-    if (status_pending || STATUS_DUE) {
-      RefereeLinkStatusFrame frame{};
-      frame.sequence = referee_status_sequence_++;
-      frame.referee_online = referee_pack.referee_online ? 1U : 0U;
-      frame.supported_mask = Referee::SUPPORTED_SOURCE_MASK;
-      frame.valid_mask = referee_pack.source_valid_mask;
-      SendClassicFrame(tx_id_ + REFEREE_LINK_STATUS_ID_OFFSET, frame);
+      const bool STATUS_DUE = IsDue(now_ms, state_.next_referee_status_tx_ms_,
+                                    REFEREE_STATUS_PERIOD_MS);
+      if (status_pending || STATUS_DUE) {
+        RefereeLinkStatusFrame frame{};
+        frame.sequence = state_.referee_status_sequence_++;
+        frame.referee_online = referee_pack.referee_online ? 1U : 0U;
+        frame.supported_mask = Referee::SUPPORTED_SOURCE_MASK;
+        frame.valid_mask = referee_pack.source_valid_mask;
+        SendClassicFrame(tx_id_ + REFEREE_LINK_STATUS_ID_OFFSET, frame);
+      }
     }
   }
 
@@ -1310,23 +1715,21 @@ class DualBoard : public LibXR::Application {
       return;
     }
 
+    ClearLatchedBusFaultIfUnobservable();
     auto offset = pack.id - rx_id_;
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
       if (offset == CONTROL_ID_OFFSET) {
         HandleControlFrame(pack);
-      } else if (offset == FORCE_ID_OFFSET) {
-        HandleForceFrame(pack);
       } else if (offset == ANGLE_ID_OFFSET) {
         HandleAngleFrame(pack);
+      } else if (offset == USE_CAPACITOR_ID_OFFSET) {
+        HandleUseCapacitorFrame(pack);
       } else if (offset == DECISION_ID_OFFSET) {
         HandleDecisionFrame(pack);
       } else if (offset == ATTITUDE_ID_OFFSET) {
         HandleAttitudeFrame(pack);
       }
     } else if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      if (HandleWheelTelemetryFrame(offset, pack)) {
-        return;
-      }
       if (HandleRefereeFrame(offset, pack)) {
         return;
       }
@@ -1342,197 +1745,17 @@ class DualBoard : public LibXR::Application {
     }
   }
 
-  static bool IsNewerWheelSequence(uint16_t candidate, uint16_t reference) {
-    return static_cast<int16_t>(candidate - reference) > 0;
-  }
-
-  void ResetWheelAssembly(uint16_t sequence, uint32_t now_ms) {
-    wheel_assembly_ = {};
-    wheel_assembly_.active = true;
-    wheel_assembly_.sequence = sequence;
-    wheel_assembly_.started_ms = now_ms;
-  }
-
-  bool PrepareWheelFragment(uint16_t sequence, uint8_t mask, uint32_t now_ms) {
-    if (wheel_assembly_.active &&
-        now_ms - wheel_assembly_.started_ms > WHEEL_ASSEMBLY_TIMEOUT_MS) {
-      wheel_assembly_ = {};
-    }
-    if (wheel_completed_ && sequence == last_wheel_sequence_) {
-      return false;
-    }
-    if (!wheel_assembly_.active) {
-      ResetWheelAssembly(sequence, now_ms);
-    } else if (sequence != wheel_assembly_.sequence) {
-      if (!IsNewerWheelSequence(sequence, wheel_assembly_.sequence)) {
-        return false;
-      }
-      ResetWheelAssembly(sequence, now_ms);
-    }
-    if ((wheel_assembly_.received_mask & mask) != 0U) {
-      return false;
-    }
-    wheel_assembly_.received_mask |= mask;
-    return true;
-  }
-
-  bool HandleWheelTelemetryFrame(const uint32_t offset,
-                                 const LibXR::CAN::ClassicPack& pack) {
-    if constexpr (ROLE != DualBoardRole::GIMBAL) {
-      UNUSED(offset);
-      UNUSED(pack);
-      return false;
-    }
-    if (offset < WHEEL_TELEMETRY_META_ID_OFFSET ||
-        offset > WHEEL_TELEMETRY_PAIR23_ID_OFFSET) {
-      return false;
-    }
-
-    ChassisWheelTelemetry complete{};
-    bool publish = false;
-    const uint32_t NOW_MS =
-        static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-    {
-      LibXR::Mutex::LockGuard lock(wheel_mutex_);
-      if (offset == WHEEL_TELEMETRY_META_ID_OFFSET) {
-        WheelTelemetryMetaFrame frame{};
-        LoadClassicFrame(pack, frame);
-        if (frame.version != WHEEL_TELEMETRY_VERSION ||
-            !PrepareWheelFragment(frame.sequence, WHEEL_META_RECEIVED,
-                                  NOW_MS)) {
-          return true;
-        }
-        wheel_assembly_.meta = frame;
-      } else if (offset == WHEEL_TELEMETRY_PAIR01_ID_OFFSET) {
-        WheelTelemetryPairFrame frame{};
-        LoadClassicFrame(pack, frame);
-        if (!PrepareWheelFragment(frame.sequence, WHEEL_PAIR01_RECEIVED,
-                                  NOW_MS)) {
-          return true;
-        }
-        wheel_assembly_.pair01 = frame;
-      } else if (offset == WHEEL_TELEMETRY_DIAGNOSTIC_ID_OFFSET) {
-        WheelTelemetryDiagnosticFrame frame{};
-        LoadClassicFrame(pack, frame);
-        if (!PrepareWheelFragment(frame.sequence, WHEEL_DIAGNOSTIC_RECEIVED,
-                                  NOW_MS)) {
-          return true;
-        }
-        wheel_assembly_.diagnostic = frame;
-      } else {
-        WheelTelemetryPairFrame frame{};
-        LoadClassicFrame(pack, frame);
-        if (!PrepareWheelFragment(frame.sequence, WHEEL_PAIR23_RECEIVED,
-                                  NOW_MS)) {
-          return true;
-        }
-        wheel_assembly_.pair23 = frame;
-      }
-
-      if ((wheel_assembly_.received_mask & WHEEL_REQUIRED_MASK) ==
-          WHEEL_REQUIRED_MASK) {
-        complete.sample_time_us = wheel_assembly_.meta.sample_time_us;
-        complete.sequence = wheel_assembly_.sequence;
-        complete.wheel_angular_velocity[0] =
-            static_cast<float>(wheel_assembly_.pair01.first_wheel_q) /
-            WHEEL_Q_SCALE;
-        complete.wheel_angular_velocity[1] =
-            static_cast<float>(wheel_assembly_.pair01.second_wheel_q) /
-            WHEEL_Q_SCALE;
-        complete.wheel_angular_velocity[2] =
-            static_cast<float>(wheel_assembly_.pair23.first_wheel_q) /
-            WHEEL_Q_SCALE;
-        complete.wheel_angular_velocity[3] =
-            static_cast<float>(wheel_assembly_.pair23.second_wheel_q) /
-            WHEEL_Q_SCALE;
-        complete.wheel_status[0] = wheel_assembly_.pair01.first_status;
-        complete.wheel_status[1] = wheel_assembly_.pair01.second_status;
-        complete.wheel_status[2] = wheel_assembly_.pair23.first_status;
-        complete.wheel_status[3] = wheel_assembly_.pair23.second_status;
-        complete.global_status =
-            static_cast<uint8_t>((wheel_assembly_.meta.global_status |
-                                  ChassisWheelTelemetry::TRANSPORT_VALID) &
-                                 ~ChassisWheelTelemetry::TIME_SYNC_VALID);
-        if ((wheel_assembly_.received_mask & WHEEL_DIAGNOSTIC_RECEIVED) != 0U) {
-          complete.vx = static_cast<float>(wheel_assembly_.diagnostic.vx_mm_s) /
-                        DIAGNOSTIC_LINEAR_SCALE;
-          complete.vy = static_cast<float>(wheel_assembly_.diagnostic.vy_mm_s) /
-                        DIAGNOSTIC_LINEAR_SCALE;
-          complete.wz =
-              static_cast<float>(wheel_assembly_.diagnostic.wz_mrad_s) /
-              DIAGNOSTIC_ANGULAR_SCALE;
-        } else {
-          complete.global_status &=
-              static_cast<uint8_t>(~ChassisWheelTelemetry::DIAGNOSTIC_VALID);
-        }
-        last_wheel_telemetry_ = complete;
-        last_wheel_sequence_ = complete.sequence;
-        last_wheel_rx_ms_ = NOW_MS;
-        wheel_stream_received_ = true;
-        wheel_stream_stale_ = false;
-        wheel_completed_ = true;
-        wheel_assembly_ = {};
-        publish = true;
-      }
-    }
-    if (publish) {
-      wheel_telemetry_topic_.Publish(complete);
-    }
-    return true;
-  }
-
-  void ExpireWheelTelemetryAssembly(uint32_t now_ms) {
-    if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      LibXR::Mutex::LockGuard lock(wheel_mutex_);
-      if (wheel_assembly_.active &&
-          now_ms - wheel_assembly_.started_ms > WHEEL_ASSEMBLY_TIMEOUT_MS) {
-        wheel_assembly_ = {};
-      }
-    } else {
-      UNUSED(now_ms);
-    }
-  }
-
-  static ChassisWheelTelemetry MakeInvalidWheelTelemetry(
-      ChassisWheelTelemetry sample) {
-    sample.global_status &=
-        static_cast<uint8_t>(~(ChassisWheelTelemetry::TRANSPORT_VALID |
-                               ChassisWheelTelemetry::TIME_SYNC_VALID |
-                               ChassisWheelTelemetry::DIAGNOSTIC_VALID));
-    sample.global_status |= ChassisWheelTelemetry::STALE;
-    sample.vx = 0.0f;
-    sample.vy = 0.0f;
-    sample.wz = 0.0f;
-    for (auto& status : sample.wheel_status) {
-      status &= static_cast<uint8_t>(~ChassisWheelTelemetry::FRESH);
-    }
-    return sample;
-  }
-
-  void CheckWheelTelemetryWatchdog(uint32_t now_ms) {
-    if constexpr (ROLE != DualBoardRole::GIMBAL) {
-      UNUSED(now_ms);
-      return;
-    }
-    ChassisWheelTelemetry invalid{};
-    bool publish = false;
-    {
-      LibXR::Mutex::LockGuard lock(wheel_mutex_);
-      const uint32_t REFERENCE_MS =
-          wheel_stream_received_ ? last_wheel_rx_ms_ : wheel_watchdog_start_ms_;
-      if (now_ms - REFERENCE_MS <= WHEEL_STREAM_TIMEOUT_MS) {
+  void HandleUseCapacitorFrame(const LibXR::CAN::ClassicPack& pack) {
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      Pldx::DualBoardControl::UseCapacitorCommand frame{};
+      LoadClassicFrame(pack, frame);
+      bool enabled = true;
+      if (!Pldx::DualBoardControl::DecodeUseCapacitor(frame, enabled)) {
         return;
       }
-      if (!wheel_stream_stale_ ||
-          now_ms - last_wheel_stale_publish_ms_ >= WHEEL_STALE_HEARTBEAT_MS) {
-        invalid = MakeInvalidWheelTelemetry(last_wheel_telemetry_);
-        wheel_stream_stale_ = true;
-        last_wheel_stale_publish_ms_ = now_ms;
-        publish = true;
-      }
-    }
-    if (publish) {
-      wheel_telemetry_topic_.Publish(invalid);
+      state_.use_capacitor_topic_.Publish(enabled);
+    } else {
+      UNUSED(pack);
     }
   }
 
@@ -1546,8 +1769,7 @@ class DualBoard : public LibXR::Application {
 
       const uint32_t now_ms =
           static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-      last_decision_rx_time_ms_ = now_ms;
-      if (!decision_sequence_tracker_.Accept(frame.sequence, now_ms)) {
+      if (!state_.decision_sequence_tracker_.Accept(frame.sequence, now_ms)) {
         return;
       }
 
@@ -1591,129 +1813,145 @@ class DualBoard : public LibXR::Application {
                          const LibXR::CAN::ClassicPack& pack, uint32_t now_ms,
                          Data& output, uint16_t source_mask,
                          Referee::CommandID command_id) {
-    if (offset < base_offset || offset >= base_offset + fragment_count) {
-      return false;
-    }
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      if (offset < base_offset || offset >= base_offset + fragment_count) {
+        return false;
+      }
 
-    RefereeFragmentFrame frame{};
-    LoadClassicFrame(pack, frame);
-    const auto result = RefereeCanCodec::Push(
-        assembly, static_cast<size_t>(offset - base_offset), frame, now_ms,
-        output);
-    if (result != RefereeCanCodec::PushResult::COMPLETE) return false;
-    local_referee_valid_mask_ |= source_mask;
-    if (source_mask == Referee::SOURCE_SENTRY_POS) {
-      gimbal_sentry_ref_.sentry_pos_received_time_ms = now_ms;
-    } else if (source_mask == Referee::SOURCE_ROBOT_HP) {
-      gimbal_sentry_ref_.robot_hp_received_time_ms = now_ms;
+      RefereeFragmentFrame frame{};
+      LoadClassicFrame(pack, frame);
+      const auto result = RefereeCanCodec::Push(
+          assembly, static_cast<size_t>(offset - base_offset), frame, now_ms,
+          output);
+      if (result != RefereeCanCodec::PushResult::COMPLETE) return false;
+      state_.local_referee_valid_mask_ |= source_mask;
+      if (source_mask == Referee::SOURCE_SENTRY_POS) {
+        state_.gimbal_sentry_ref_.sentry_pos_received_time_ms = now_ms;
+      } else if (source_mask == Referee::SOURCE_ROBOT_HP) {
+        state_.gimbal_sentry_ref_.robot_hp_received_time_ms = now_ms;
+      }
+      state_.gimbal_sentry_ref_.source_command_id =
+          static_cast<uint16_t>(command_id);
+      state_.gimbal_sentry_ref_.source_valid_mask =
+          RefereeCanCodec::IntersectValidity(
+              state_.upstream_referee_online_, state_.local_referee_valid_mask_,
+              state_.upstream_referee_valid_mask_,
+              Referee::SUPPORTED_SOURCE_MASK);
+      state_.gimbal_sentry_ref_.referee_online =
+          state_.upstream_referee_online_;
+      sentry_ref_topic_.Publish(state_.gimbal_sentry_ref_);
+      return true;
     }
-    gimbal_sentry_ref_.source_command_id = static_cast<uint16_t>(command_id);
-    gimbal_sentry_ref_.source_valid_mask = RefereeCanCodec::IntersectValidity(
-        upstream_referee_online_, local_referee_valid_mask_,
-        upstream_referee_valid_mask_, Referee::SUPPORTED_SOURCE_MASK);
-    gimbal_sentry_ref_.referee_online = upstream_referee_online_;
-    sentry_ref_topic_.Publish(gimbal_sentry_ref_);
-    return true;
+    return false;
   }
 
   bool HandleRefereeFrame(uint32_t offset,
                           const LibXR::CAN::ClassicPack& pack) {
-    if constexpr (ROLE != DualBoardRole::GIMBAL) {
-      UNUSED(offset);
-      UNUSED(pack);
-      return false;
-    }
-    const uint32_t now_ms =
-        static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-    if (offset == REFEREE_LINK_STATUS_ID_OFFSET) {
-      RefereeLinkStatusFrame frame{};
-      LoadClassicFrame(pack, frame);
-      upstream_referee_online_ = frame.referee_online == 1U;
-      upstream_referee_valid_mask_ = frame.valid_mask & frame.supported_mask;
-      if (!upstream_referee_online_) {
-        local_referee_valid_mask_ = 0U;
-      }
-      gimbal_sentry_ref_.source_command_id = 0U;
-      gimbal_sentry_ref_.source_valid_mask = RefereeCanCodec::IntersectValidity(
-          upstream_referee_online_, local_referee_valid_mask_,
-          upstream_referee_valid_mask_, Referee::SUPPORTED_SOURCE_MASK);
-      gimbal_sentry_ref_.referee_online = upstream_referee_online_;
-      sentry_ref_topic_.Publish(gimbal_sentry_ref_);
-      last_rx_time_ms_ = now_ms;
-      online_ = true;
-      safe_state_published_ = false;
-      return true;
-    }
-    if (offset == REFEREE_GAME_STATUS_ID_OFFSET) {
-      RefereeFragmentFrame frame{};
-      LoadClassicFrame(pack, frame);
-      auto& assembly = referee_assemblies_[0];
-      if (assembly.has_published &&
-          assembly.published_sequence == frame.sequence) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      const uint32_t now_ms =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+      if (offset == REFEREE_LINK_STATUS_ID_OFFSET) {
+        RefereeLinkStatusFrame frame{};
+        LoadClassicFrame(pack, frame);
+        state_.upstream_referee_online_ = frame.referee_online == 1U;
+        state_.upstream_referee_valid_mask_ =
+            frame.valid_mask & frame.supported_mask;
+        if (!state_.upstream_referee_online_) {
+          state_.local_referee_valid_mask_ = 0U;
+        }
+        state_.gimbal_sentry_ref_.source_command_id = 0U;
+        state_.gimbal_sentry_ref_.source_valid_mask =
+            RefereeCanCodec::IntersectValidity(
+                state_.upstream_referee_online_,
+                state_.local_referee_valid_mask_,
+                state_.upstream_referee_valid_mask_,
+                Referee::SUPPORTED_SOURCE_MASK);
+        state_.gimbal_sentry_ref_.referee_online =
+            state_.upstream_referee_online_;
+        sentry_ref_topic_.Publish(state_.gimbal_sentry_ref_);
+        last_rx_time_ms_ = now_ms;
+        online_ = true;
+        safe_state_published_ = false;
         return true;
       }
-      assembly.has_published = true;
-      assembly.published_sequence = frame.sequence;
-      gimbal_sentry_ref_.game_status.game_type = frame.data[0];
-      gimbal_sentry_ref_.game_status.game_progress = frame.data[1];
-      LibXR::Memory::FastCopy(&gimbal_sentry_ref_.game_status.stage_remain_time,
-                              &frame.data[2], sizeof(uint16_t));
-      local_referee_valid_mask_ |= Referee::SOURCE_GAME_STATUS;
-      gimbal_sentry_ref_.source_command_id =
-          static_cast<uint16_t>(Referee::CommandID::REF_CMD_ID_GAME_STATUS);
-      gimbal_sentry_ref_.source_valid_mask = RefereeCanCodec::IntersectValidity(
-          upstream_referee_online_, local_referee_valid_mask_,
-          upstream_referee_valid_mask_, Referee::SUPPORTED_SOURCE_MASK);
-      gimbal_sentry_ref_.referee_online = upstream_referee_online_;
-      sentry_ref_topic_.Publish(gimbal_sentry_ref_);
-      last_rx_time_ms_ = now_ms;
-      online_ = true;
-      safe_state_published_ = false;
-      return true;
-    }
+      if (offset == REFEREE_GAME_STATUS_ID_OFFSET) {
+        RefereeFragmentFrame frame{};
+        LoadClassicFrame(pack, frame);
+        auto& assembly = state_.referee_assemblies_[0];
+        if (assembly.has_published &&
+            assembly.published_sequence == frame.sequence) {
+          return true;
+        }
+        assembly.has_published = true;
+        assembly.published_sequence = frame.sequence;
+        state_.gimbal_sentry_ref_.game_status.game_type = frame.data[0];
+        state_.gimbal_sentry_ref_.game_status.game_progress = frame.data[1];
+        LibXR::Memory::FastCopy(
+            &state_.gimbal_sentry_ref_.game_status.stage_remain_time,
+            &frame.data[2], sizeof(uint16_t));
+        state_.local_referee_valid_mask_ |= Referee::SOURCE_GAME_STATUS;
+        state_.gimbal_sentry_ref_.source_command_id =
+            static_cast<uint16_t>(Referee::CommandID::REF_CMD_ID_GAME_STATUS);
+        state_.gimbal_sentry_ref_.source_valid_mask =
+            RefereeCanCodec::IntersectValidity(
+                state_.upstream_referee_online_,
+                state_.local_referee_valid_mask_,
+                state_.upstream_referee_valid_mask_,
+                Referee::SUPPORTED_SOURCE_MASK);
+        state_.gimbal_sentry_ref_.referee_online =
+            state_.upstream_referee_online_;
+        sentry_ref_topic_.Publish(state_.gimbal_sentry_ref_);
+        last_rx_time_ms_ = now_ms;
+        online_ = true;
+        safe_state_published_ = false;
+        return true;
+      }
 
-#define HANDLE_REFEREE_GROUP(BASE, COUNT, STATE, FIELD, MASK, COMMAND) \
-  if (ReassembleReferee(offset, BASE, COUNT, STATE, pack, now_ms,      \
-                        gimbal_sentry_ref_.FIELD, MASK, COMMAND)) {    \
-    last_rx_time_ms_ = now_ms;                                         \
-    online_ = true;                                                    \
-    safe_state_published_ = false;                                     \
-    return true;                                                       \
+#define HANDLE_REFEREE_GROUP(BASE, COUNT, STATE, FIELD, MASK, COMMAND)     \
+  if (ReassembleReferee(offset, BASE, COUNT, STATE, pack, now_ms,          \
+                        state_.gimbal_sentry_ref_.FIELD, MASK, COMMAND)) { \
+    last_rx_time_ms_ = now_ms;                                             \
+    online_ = true;                                                        \
+    safe_state_published_ = false;                                         \
+    return true;                                                           \
   }
-    HANDLE_REFEREE_GROUP(REFEREE_ROBOT_HP_ID_OFFSET, 3U, referee_assemblies_[1],
-                         robot_hp, Referee::SOURCE_ROBOT_HP,
-                         Referee::CommandID::REF_CMD_ID_GAME_ROBOT_HP)
-    HANDLE_REFEREE_GROUP(REFEREE_FIELD_EVENT_ID_OFFSET, 1U,
-                         referee_assemblies_[2], field_event,
-                         Referee::SOURCE_FIELD_EVENT,
-                         Referee::CommandID::REF_CMD_ID_FIELD_EVENTS)
-    HANDLE_REFEREE_GROUP(REFEREE_ROBOT_STATUS_ID_OFFSET, 3U,
-                         referee_assemblies_[3], robot_status,
-                         Referee::SOURCE_ROBOT_STATUS,
-                         Referee::CommandID::REF_CMD_ID_ROBOT_STATUS)
-    HANDLE_REFEREE_GROUP(REFEREE_POWER_HEAT_ID_OFFSET, 2U,
-                         referee_assemblies_[4], power_heat,
-                         Referee::SOURCE_POWER_HEAT,
-                         Referee::CommandID::REF_CMD_ID_POWER_HEAT_DATA)
-    HANDLE_REFEREE_GROUP(REFEREE_ROBOT_POS_ID_OFFSET, 6U,
-                         referee_assemblies_[5], sentry_pos,
-                         Referee::SOURCE_SENTRY_POS,
-                         Referee::CommandID::REF_CMD_ID_ROBOT_POS_TO_SENTRY)
-    HANDLE_REFEREE_GROUP(
-        REFEREE_ROBOT_BUFF_ID_OFFSET, 2U, referee_assemblies_[6], robot_buff,
-        Referee::SOURCE_ROBOT_BUFF, Referee::CommandID::REF_CMD_ID_ROBOT_BUFF)
-    HANDLE_REFEREE_GROUP(REFEREE_ROBOT_DAMAGE_ID_OFFSET, 1U,
-                         referee_assemblies_[7], robot_damage,
-                         Referee::SOURCE_ROBOT_DAMAGE,
-                         Referee::CommandID::REF_CMD_ID_ROBOT_DMG)
-    HANDLE_REFEREE_GROUP(REFEREE_BULLET_REMAIN_ID_OFFSET, 2U,
-                         referee_assemblies_[8], bullet_remain,
-                         Referee::SOURCE_BULLET_REMAIN,
-                         Referee::CommandID::REF_CMD_ID_BULLET_REMAINING)
-    HANDLE_REFEREE_GROUP(REFEREE_RFID_ID_OFFSET, 1U, referee_assemblies_[9],
-                         rfid, Referee::SOURCE_RFID,
-                         Referee::CommandID::REF_CMD_ID_RFID)
+      HANDLE_REFEREE_GROUP(REFEREE_ROBOT_HP_ID_OFFSET, 3U,
+                           state_.referee_assemblies_[1], robot_hp,
+                           Referee::SOURCE_ROBOT_HP,
+                           Referee::CommandID::REF_CMD_ID_GAME_ROBOT_HP)
+      HANDLE_REFEREE_GROUP(REFEREE_FIELD_EVENT_ID_OFFSET, 1U,
+                           state_.referee_assemblies_[2], field_event,
+                           Referee::SOURCE_FIELD_EVENT,
+                           Referee::CommandID::REF_CMD_ID_FIELD_EVENTS)
+      HANDLE_REFEREE_GROUP(REFEREE_ROBOT_STATUS_ID_OFFSET, 3U,
+                           state_.referee_assemblies_[3], robot_status,
+                           Referee::SOURCE_ROBOT_STATUS,
+                           Referee::CommandID::REF_CMD_ID_ROBOT_STATUS)
+      HANDLE_REFEREE_GROUP(REFEREE_POWER_HEAT_ID_OFFSET, 2U,
+                           state_.referee_assemblies_[4], power_heat,
+                           Referee::SOURCE_POWER_HEAT,
+                           Referee::CommandID::REF_CMD_ID_POWER_HEAT_DATA)
+      HANDLE_REFEREE_GROUP(REFEREE_ROBOT_POS_ID_OFFSET, 6U,
+                           state_.referee_assemblies_[5], sentry_pos,
+                           Referee::SOURCE_SENTRY_POS,
+                           Referee::CommandID::REF_CMD_ID_ROBOT_POS_TO_SENTRY)
+      HANDLE_REFEREE_GROUP(REFEREE_ROBOT_BUFF_ID_OFFSET, 2U,
+                           state_.referee_assemblies_[6], robot_buff,
+                           Referee::SOURCE_ROBOT_BUFF,
+                           Referee::CommandID::REF_CMD_ID_ROBOT_BUFF)
+      HANDLE_REFEREE_GROUP(REFEREE_ROBOT_DAMAGE_ID_OFFSET, 1U,
+                           state_.referee_assemblies_[7], robot_damage,
+                           Referee::SOURCE_ROBOT_DAMAGE,
+                           Referee::CommandID::REF_CMD_ID_ROBOT_DMG)
+      HANDLE_REFEREE_GROUP(REFEREE_BULLET_REMAIN_ID_OFFSET, 2U,
+                           state_.referee_assemblies_[8], bullet_remain,
+                           Referee::SOURCE_BULLET_REMAIN,
+                           Referee::CommandID::REF_CMD_ID_BULLET_REMAINING)
+      HANDLE_REFEREE_GROUP(
+          REFEREE_RFID_ID_OFFSET, 1U, state_.referee_assemblies_[9], rfid,
+          Referee::SOURCE_RFID, Referee::CommandID::REF_CMD_ID_RFID)
 #undef HANDLE_REFEREE_GROUP
+    }
     return false;
   }
 
@@ -1730,11 +1968,11 @@ class DualBoard : public LibXR::Application {
         online_ = true;
         safe_state_published_ = false;
         const float gyro_z = DecodeSigned(frame.gyro_z_q, GYRO_SCALE);
-        motion_state_.yaw_rate_rad_s =
+        state_.motion_state_.yaw_rate_rad_s =
             frame.gyro_valid == 1U && std::isfinite(gyro_z) ? gyro_z : 0.0f;
-        motion_state_.yaw_rate_valid =
+        state_.motion_state_.yaw_rate_valid =
             frame.gyro_valid == 1U && std::isfinite(gyro_z);
-        motion_state_.online = true;
+        state_.motion_state_.online = true;
         PublishMotionStateLocked();
       }
     } else {
@@ -1752,30 +1990,28 @@ class DualBoard : public LibXR::Application {
       const uint32_t now_ms =
           static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
       const bool accepted = valid && std::isfinite(yaw);
-      PublishValue(chassis_imu_yaw_topic_, accepted ? yaw : 0.0F);
-      PublishValue(chassis_imu_yaw_valid_topic_, accepted);
-      last_chassis_yaw_rx_ms_ = now_ms;
-      chassis_yaw_stale_ = !accepted;
+      PublishValue(state_.chassis_imu_yaw_topic_, accepted ? yaw : 0.0F);
+      PublishValue(state_.chassis_imu_yaw_valid_topic_, accepted);
+      state_.last_chassis_yaw_rx_ms_ = now_ms;
+      state_.chassis_yaw_stale_ = !accepted;
     } else {
       UNUSED(pack);
     }
   }
 
   void CheckChassisYawWatchdog(uint32_t now_ms) {
-    if constexpr (ROLE != DualBoardRole::GIMBAL) {
-      UNUSED(now_ms);
-      return;
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      if (state_.last_chassis_yaw_rx_ms_ != 0U &&
+          now_ms - state_.last_chassis_yaw_rx_ms_ <= CHASSIS_YAW_TIMEOUT_MS) {
+        return;
+      }
+      if (state_.chassis_yaw_stale_) {
+        return;
+      }
+      PublishValue(state_.chassis_imu_yaw_topic_, 0.0F);
+      PublishValue(state_.chassis_imu_yaw_valid_topic_, false);
+      state_.chassis_yaw_stale_ = true;
     }
-    if (last_chassis_yaw_rx_ms_ != 0U &&
-        now_ms - last_chassis_yaw_rx_ms_ <= CHASSIS_YAW_TIMEOUT_MS) {
-      return;
-    }
-    if (chassis_yaw_stale_) {
-      return;
-    }
-    PublishValue(chassis_imu_yaw_topic_, 0.0F);
-    PublishValue(chassis_imu_yaw_valid_topic_, false);
-    chassis_yaw_stale_ = true;
   }
 
   void HandleCapacitorFrame(const LibXR::CAN::ClassicPack& pack) {
@@ -1785,31 +2021,29 @@ class DualBoard : public LibXR::Application {
       const bool VALID = frame.valid == 1U && frame.capacity_percent <= 100U;
       const uint32_t NOW_MS =
           static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-      PublishValue<uint8_t>(chassis_capacitor_capacity_topic_,
+      PublishValue<uint8_t>(state_.chassis_capacitor_capacity_topic_,
                             VALID ? frame.capacity_percent : 255U);
-      PublishValue(chassis_capacitor_valid_topic_, VALID);
-      last_capacitor_rx_ms_ = NOW_MS;
-      capacitor_stale_ = !VALID;
+      PublishValue(state_.chassis_capacitor_valid_topic_, VALID);
+      state_.last_capacitor_rx_ms_ = NOW_MS;
+      state_.capacitor_stale_ = !VALID;
     } else {
       UNUSED(pack);
     }
   }
 
   void CheckCapacitorWatchdog(uint32_t now_ms) {
-    if constexpr (ROLE != DualBoardRole::GIMBAL) {
-      UNUSED(now_ms);
-      return;
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      if (state_.last_capacitor_rx_ms_ != 0U &&
+          now_ms - state_.last_capacitor_rx_ms_ <= CAPACITOR_TIMEOUT_MS) {
+        return;
+      }
+      if (state_.capacitor_stale_) {
+        return;
+      }
+      PublishValue<uint8_t>(state_.chassis_capacitor_capacity_topic_, 255U);
+      PublishValue(state_.chassis_capacitor_valid_topic_, false);
+      state_.capacitor_stale_ = true;
     }
-    if (last_capacitor_rx_ms_ != 0U &&
-        now_ms - last_capacitor_rx_ms_ <= CAPACITOR_TIMEOUT_MS) {
-      return;
-    }
-    if (capacitor_stale_) {
-      return;
-    }
-    PublishValue<uint8_t>(chassis_capacitor_capacity_topic_, 255U);
-    PublishValue(chassis_capacitor_valid_topic_, false);
-    capacitor_stale_ = true;
   }
 
   void HandleControlFrame(const LibXR::CAN::ClassicPack& pack) {
@@ -1817,73 +2051,38 @@ class DualBoard : public LibXR::Application {
       ControlFrame frame{};
       LoadClassicFrame(pack, frame);
 
-      const auto now_ms =
-          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-      Pldx::DualBoardControl::ProcessResult result{};
-      {
-        LibXR::Mutex::LockGuard lock(control_admission_mutex_);
-        result = control_admission_.Process(frame, now_ms);
-      }
-      const bool restored = !online_;
-      last_rx_time_ms_ = now_ms;
-      online_ = true;
-      if (!result.accepted) {
-        PublishSafeChassisState();
-        safe_state_published_ = true;
+      Pldx::DualBoardControl::Command decoded{};
+      if (!Pldx::DualBoardControl::Decode(frame, decoded)) {
         return;
       }
 
-      CMD::ChassisCMD command{};
-      command.x = result.command.x;
-      command.y = result.command.y;
-      command.z = result.command.z;
-      command.self_define =
-          static_cast<CMD::ChasStat>(result.command.self_define);
-      command.si_units = result.command.si_units;
-      command.force_control = result.command.force_control;
-      if (command.force_control) {
-        if (!remote_force_valid_ || !remote_force_control_ ||
-            now_ms - last_force_rx_ms_ > FORCE_TIMEOUT_MS) {
-          PublishSafeChassisState();
-          safe_state_published_ = true;
-          return;
-        }
-        command.force_x_global_n = remote_force_x_global_n_;
-        command.force_y_global_n = remote_force_y_global_n_;
-        command.torque_z_global_nm = remote_torque_z_global_nm_;
-      }
-      chassis_cmd_topic_.Publish(command);
-
+      const bool restored = !online_;
+      last_rx_time_ms_ =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+      online_ = true;
       safe_state_published_ = false;
 
-      const uint8_t MODE = static_cast<uint8_t>(result.command.mode);
-      if (restored || remote_mode_ != MODE) {
+      CMD::ChassisCMD command{};
+      command.source =
+          decoded.source == Pldx::DualBoardControl::Source::NAVIGATION
+              ? CMD::ChassisCommandSource::NAVIGATION
+              : CMD::ChassisCommandSource::OPERATOR;
+      command.operator_input = {decoded.operator_input.x,
+                                decoded.operator_input.y,
+                                decoded.operator_input.z};
+      command.navigation_velocity = {decoded.navigation_velocity.vx_mps,
+                                     decoded.navigation_velocity.vy_mps,
+                                     decoded.navigation_velocity.wz_rad_s};
+      command.self_define = static_cast<CMD::ChasStat>(decoded.self_define);
+      state_.chassis_cmd_topic_.Publish(command);
+
+      const uint8_t MODE = static_cast<uint8_t>(decoded.mode);
+      if (restored || state_.remote_mode_ != MODE) {
         uint32_t mode = MODE;
         mode_topic_.Publish(mode);
         ForceRemoteMode(mode);
-        remote_mode_ = MODE;
+        state_.remote_mode_ = MODE;
       }
-    } else {
-      UNUSED(pack);
-    }
-  }
-
-  void HandleForceFrame(const LibXR::CAN::ClassicPack& pack) {
-    if constexpr (ROLE == DualBoardRole::CHASSIS) {
-      ForceFrame frame{};
-      LoadClassicFrame(pack, frame);
-      Pldx::DualBoardControl::Command wire_command{};
-      if (!Pldx::DualBoardControl::DecodeForce(frame, wire_command)) {
-        remote_force_valid_ = false;
-        return;
-      }
-      remote_force_x_global_n_ = wire_command.force_x_global_n;
-      remote_force_y_global_n_ = wire_command.force_y_global_n;
-      remote_torque_z_global_nm_ = wire_command.torque_z_global_nm;
-      remote_force_control_ = wire_command.force_control;
-      remote_force_valid_ = true;
-      last_force_rx_ms_ =
-          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
     } else {
       UNUSED(pack);
     }
@@ -1899,8 +2098,8 @@ class DualBoard : public LibXR::Application {
       LoadClassicFrame(pack, frame);
       float yaw_angle = DecodeSigned(frame.yaw, ANGLE_SCALE);
       float pitch_angle = DecodeSigned(frame.pitch, ANGLE_SCALE);
-      yaw_angle_topic_.Publish(yaw_angle);
-      pitch_angle_topic_.Publish(pitch_angle);
+      state_.yaw_angle_topic_.Publish(yaw_angle);
+      state_.pitch_angle_topic_.Publish(pitch_angle);
     } else {
       UNUSED(pack);
     }
@@ -1917,7 +2116,7 @@ class DualBoard : public LibXR::Application {
       LibXR::EulerAngle<float> attitude(DecodeSigned(frame.roll, ANGLE_SCALE),
                                         DecodeSigned(frame.pitch, ANGLE_SCALE),
                                         DecodeSigned(frame.yaw, ANGLE_SCALE));
-      attitude_topic_.Publish(attitude);
+      state_.attitude_topic_.Publish(attitude);
     } else {
       UNUSED(pack);
     }
@@ -1946,12 +2145,19 @@ class DualBoard : public LibXR::Application {
     }
   }
 
+  bool LinkTimedOut(uint32_t now_ms) const {
+    return offline_timeout_ms_ != 0U && last_rx_time_ms_ != 0U &&
+           (now_ms - last_rx_time_ms_) > offline_timeout_ms_;
+  }
+
   void CheckOffline(uint32_t now_ms) {
+    RefreshCanErrorState();
+    const bool BUS_FAULT = can_bus_fault_.IsSet();
+
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       {
         LibXR::Mutex::LockGuard lock(data_mutex_);
-        if (offline_timeout_ms_ == 0U || last_rx_time_ms_ == 0U ||
-            (now_ms - last_rx_time_ms_) <= offline_timeout_ms_) {
+        if (!BUS_FAULT && !LinkTimedOut(now_ms)) {
           return;
         }
 
@@ -1962,25 +2168,16 @@ class DualBoard : public LibXR::Application {
       }
 
       PublishOfflineState();
-      return;
-    }
+    } else {
+      if (!BUS_FAULT && !LinkTimedOut(now_ms)) {
+        return;
+      }
 
-    if (offline_timeout_ms_ == 0U || last_rx_time_ms_ == 0U) {
-      return;
-    }
-
-    if ((now_ms - last_rx_time_ms_) <= offline_timeout_ms_) {
-      return;
-    }
-
-    online_ = false;
-    {
-      LibXR::Mutex::LockGuard lock(control_admission_mutex_);
-      control_admission_.Reset();
-    }
-    if (!safe_state_published_) {
-      PublishOfflineState();
-      safe_state_published_ = true;
+      online_ = false;
+      if (!safe_state_published_) {
+        PublishOfflineState();
+        safe_state_published_ = true;
+      }
     }
   }
 
@@ -2005,49 +2202,66 @@ class DualBoard : public LibXR::Application {
       launcher_ref_topic_.Publish(launcher_pack);
       PublishInvalidReferee();
 
-      motion_state_ = {};
+      state_.motion_state_ = {};
       PublishMotionStateLocked();
-      launcher_feedback_valid_ = false;
       safe_state_published_ = true;
     }
   }
 
   void PublishInvalidReferee() {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      local_referee_valid_mask_ = 0U;
-      upstream_referee_valid_mask_ = 0U;
-      upstream_referee_online_ = false;
-      gimbal_sentry_ref_.source_command_id = 0U;
-      gimbal_sentry_ref_.source_valid_mask = 0U;
-      gimbal_sentry_ref_.referee_online = false;
-      sentry_ref_topic_.Publish(gimbal_sentry_ref_);
+      state_.local_referee_valid_mask_ = 0U;
+      state_.upstream_referee_valid_mask_ = 0U;
+      state_.upstream_referee_online_ = false;
+      state_.gimbal_sentry_ref_.source_command_id = 0U;
+      state_.gimbal_sentry_ref_.source_valid_mask = 0U;
+      state_.gimbal_sentry_ref_.referee_online = false;
+      sentry_ref_topic_.Publish(state_.gimbal_sentry_ref_);
     }
   }
 
   void PublishMotionStateLocked() {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      chassis_motion_state_topic_.Publish(motion_state_);
+      state_.chassis_motion_state_topic_.Publish(state_.motion_state_);
+    }
+  }
+
+  void PublishSelectedModeLocked(uint8_t mode) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      if (mode == state_.last_output_chassis_mode_ &&
+          state_.output_mode_published_) {
+        return;
+      }
+      uint32_t published_mode = mode;
+      mode_topic_.Publish(published_mode);
+      state_.motion_state_.mode =
+          mode == static_cast<uint8_t>(ChassisMode::ROTOR)
+              ? ChassisMotionMode::ROTOR
+              : ChassisMotionMode::NON_ROTOR;
+      PublishMotionStateLocked();
+      state_.last_output_chassis_mode_ = mode;
+      state_.output_mode_published_ = true;
+    } else {
+      UNUSED(mode);
     }
   }
 
   void PublishSafeChassisState() {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
-      remote_force_valid_ = false;
-      remote_force_control_ = false;
       CMD::ChassisCMD command{};
       command.self_define = CMD::ChasStat::NONE;
-      chassis_cmd_topic_.Publish(command);
+      state_.chassis_cmd_topic_.Publish(command);
 
       float zero_angle = 0.0f;
-      yaw_angle_topic_.Publish(zero_angle);
-      pitch_angle_topic_.Publish(zero_angle);
+      state_.yaw_angle_topic_.Publish(zero_angle);
+      state_.pitch_angle_topic_.Publish(zero_angle);
       LibXR::EulerAngle<float> attitude{};
-      attitude_topic_.Publish(attitude);
+      state_.attitude_topic_.Publish(attitude);
 
       uint32_t mode = static_cast<uint32_t>(ChassisMode::RELAX);
       mode_topic_.Publish(mode);
       ForceRemoteMode(static_cast<uint32_t>(ChassisMode::RELAX));
-      remote_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
+      state_.remote_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
     }
   }
 
@@ -2065,14 +2279,13 @@ class DualBoard : public LibXR::Application {
     return mode == static_cast<uint32_t>(ChassisMode::RELAX) ||
            mode == static_cast<uint32_t>(ChassisMode::INDEPENDENT) ||
            mode == static_cast<uint32_t>(ChassisMode::ROTOR) ||
-           mode == static_cast<uint32_t>(ChassisMode::FOLLOW);
+           mode == static_cast<uint32_t>(ChassisMode::FOLLOW) ||
+           mode == static_cast<uint32_t>(ChassisMode::NAVIGATION);
   }
 
   LibXR::CAN* can_;
   uint32_t tx_id_;
   uint32_t rx_id_;
-  uint32_t rx_buffer_size_;
-  uint32_t tx_slot_count_;
   uint32_t offline_timeout_ms_;
   Chassis<ChassisType>* chassis_;
   CMD* cmd_;
@@ -2082,15 +2295,9 @@ class DualBoard : public LibXR::Application {
   const char* sentry_remote_buy_hp_times_topic_name_;
   const char* sentry_buy_resurrection_topic_name_;
   const char* sentry_state_topic_name_;
-  const char* wheel_telemetry_topic_name_;
   const char* chassis_euler_topic_name_;
   PowerControl* power_control_;
-
   LibXR::Topic mode_topic_;
-  LibXR::Topic chassis_cmd_topic_;
-  LibXR::Topic yaw_angle_topic_;
-  LibXR::Topic pitch_angle_topic_;
-  LibXR::Topic attitude_topic_;
   LibXR::Topic launcher_ref_topic_;
   LibXR::Topic sentry_ref_topic_;
   LibXR::Topic sentry_buy_bullet_num_topic_;
@@ -2098,96 +2305,98 @@ class DualBoard : public LibXR::Application {
   LibXR::Topic sentry_remote_buy_hp_times_topic_;
   LibXR::Topic sentry_buy_resurrection_topic_;
   LibXR::Topic sentry_state_topic_;
-  LibXR::Topic chassis_motion_state_topic_;
-  LibXR::Topic wheel_telemetry_topic_;
-  LibXR::Topic chassis_imu_yaw_topic_;
-  LibXR::Topic chassis_imu_yaw_valid_topic_;
-  LibXR::Topic chassis_capacitor_capacity_topic_;
-  LibXR::Topic chassis_capacitor_valid_topic_;
   LibXR::Event dual_board_event_;
   LibXR::CAN::Callback can_rx_callback_;
-
-  LibXR::MPMCQueue<LibXR::CAN::ClassicPack> rx_frames_;
-  LibXR::MPMCQueue<DecisionUpdate> decision_updates_{
-      DECISION_UPDATE_QUEUE_CAPACITY};
-  std::atomic<uint32_t> decision_update_drops_{0};
+  LibXR::CAN::Callback can_error_callback_;
+  LibXR::Flag::Atomic can_bus_fault_;
+  LibXR::SPSCQueue<LibXR::CAN::ClassicPack> rx_frames_;
   LibXR::Semaphore rx_sem_;
   LibXR::Thread rx_thread_;
   LibXR::Thread protocol_thread_;
   LibXR::Mutex data_mutex_;
-  LibXR::Mutex wheel_mutex_;
-  LibXR::Mutex control_admission_mutex_;
-
-  Pldx::DualBoardControl::AdmissionState control_admission_{};
-
-  CMD::ChassisCMD local_chassis_command_{};
-  float local_yaw_angle_ = 0.0f;
-  float local_pitch_angle_ = 0.0f;
-  LibXR::EulerAngle<float> local_attitude_{};
-  uint8_t local_chassis_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
-  bool local_mode_valid_ = false;
-  Referee::LauncherPack local_launcher_pack_{};
-  Referee::RobotGameRefereePack local_sentry_ref_{};
-  uint16_t pending_referee_sources_ = 0U;
-  bool referee_status_pending_ = false;
-  Referee::RobotGameRefereePack gimbal_sentry_ref_{};
-  RefereeAssembly referee_assemblies_[10]{};
-  uint16_t local_referee_valid_mask_ = 0U;
-  uint16_t upstream_referee_valid_mask_ = 0U;
-  bool upstream_referee_online_ = false;
-  bool launcher_feedback_valid_ = false;
-  Eigen::Matrix<float, 3, 1> local_chassis_gyro_{};
-  bool chassis_gyro_received_ = false;
-  float local_chassis_yaw_ = 0.0F;
-  bool chassis_yaw_valid_ = false;
-  uint32_t local_chassis_yaw_time_ms_ = 0U;
-  ChassisWheelTelemetry local_wheel_telemetry_{};
-  ChassisWheelTelemetry last_wheel_telemetry_{};
-  WheelTelemetryAssembly wheel_assembly_{};
-  ChassisMotionState motion_state_{};
-  SentryDecisionFrame pending_decision_{
-      SentryDecision::VERSION, 0U, 0U, 0U, 0U, 0U, 0U};
-  SentryDecisionFrame active_decision_{};
-  SentryDecision::RetryController decision_retry_{};
-  SentryDecision::SequenceTracker decision_sequence_tracker_{};
-
   uint32_t next_control_tx_ms_ = 0;
-  uint32_t next_chassis_yaw_tx_ms_ = 0U;
-  uint32_t next_capacitor_tx_ms_ = 0U;
-  uint32_t next_launcher_feedback_tx_ms_ = 0;
-  uint32_t next_referee_status_tx_ms_ = 0U;
-  uint32_t wheel_watchdog_start_ms_ =
-      static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-  uint32_t last_wheel_rx_ms_ = 0U;
-  uint32_t last_chassis_yaw_rx_ms_ = 0U;
-  uint32_t last_capacitor_rx_ms_ = 0U;
-  uint32_t last_force_rx_ms_ = 0U;
-  uint32_t last_wheel_stale_publish_ms_ = 0U;
   uint32_t last_rx_time_ms_ = 0;
-  uint32_t last_decision_rx_time_ms_ = 0U;
-  uint32_t last_decision_drop_log_ms_ = 0U;
-  uint32_t reported_decision_update_drops_ = 0U;
-  uint8_t remote_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
-  uint8_t tx_sequence_ = 0;
-  uint8_t force_sequence_ = 0U;
-  uint8_t chassis_yaw_sequence_ = 0U;
-  uint8_t capacitor_sequence_ = 0U;
-  uint8_t referee_sequences_[11]{};
-  uint8_t referee_status_sequence_ = 0U;
-  uint8_t decision_sequence_ = 0U;
-  uint16_t last_wheel_sequence_ = 0U;
-  float remote_force_x_global_n_ = 0.0F;
-  float remote_force_y_global_n_ = 0.0F;
-  float remote_torque_z_global_nm_ = 0.0F;
-  bool remote_force_valid_ = false;
-  bool remote_force_control_ = false;
   bool online_ = false;
   bool safe_state_published_ = false;
-  bool decision_drop_log_started_ = false;
-  bool wheel_telemetry_pending_ = false;
-  bool wheel_completed_ = false;
-  bool wheel_stream_received_ = false;
-  bool wheel_stream_stale_ = false;
-  bool chassis_yaw_stale_ = true;
-  bool capacitor_stale_ = true;
+
+  struct GimbalState {
+    LibXR::Topic chassis_motion_state_topic_;
+    LibXR::Topic chassis_imu_yaw_topic_;
+    LibXR::Topic chassis_imu_yaw_valid_topic_;
+    LibXR::Topic chassis_capacitor_capacity_topic_;
+    LibXR::Topic chassis_capacitor_valid_topic_;
+    LibXR::SPSCQueue<uint16_t> sentry_buy_bullet_updates_{
+        DECISION_UPDATE_QUEUE_CAPACITY};
+    LibXR::SPSCQueue<uint8_t> sentry_remote_buy_bullet_updates_{
+        DECISION_UPDATE_QUEUE_CAPACITY};
+    LibXR::SPSCQueue<uint8_t> sentry_remote_buy_hp_updates_{
+        DECISION_UPDATE_QUEUE_CAPACITY};
+    LibXR::SPSCQueue<bool> sentry_buy_resurrection_updates_{
+        DECISION_UPDATE_QUEUE_CAPACITY};
+    LibXR::SPSCQueue<uint8_t> sentry_state_updates_{
+        DECISION_UPDATE_QUEUE_CAPACITY};
+    std::atomic<uint32_t> decision_update_drops_{0};
+    CMD::ChassisCMD local_chassis_command_{};
+    float local_yaw_angle_ = 0.0f;
+    float local_pitch_angle_ = 0.0f;
+    LibXR::EulerAngle<float> local_attitude_{};
+    uint8_t rc_chassis_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
+    uint8_t nav_chassis_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
+    uint8_t last_output_chassis_mode_ =
+        static_cast<uint8_t>(ChassisMode::RELAX);
+    bool nav_mode_valid_ = false;
+    bool output_relax_ = false;
+    bool output_mode_published_ = false;
+    bool local_use_capacitor_ = true;
+    Referee::RobotGameRefereePack gimbal_sentry_ref_{};
+    RefereeAssembly referee_assemblies_[10]{};
+    uint16_t local_referee_valid_mask_ = 0U;
+    uint16_t upstream_referee_valid_mask_ = 0U;
+    bool upstream_referee_online_ = false;
+    ChassisMotionState motion_state_{};
+    SentryDecisionFrame pending_decision_{
+        SentryDecision::VERSION, 0U, 0U, 0U, 0U, 0U, 0U};
+    SentryDecision::RetryController decision_retry_{};
+    uint32_t last_chassis_yaw_rx_ms_ = 0U;
+    uint32_t last_capacitor_rx_ms_ = 0U;
+    uint32_t last_decision_drop_log_ms_ = 0U;
+    uint32_t reported_decision_update_drops_ = 0U;
+    uint8_t tx_sequence_ = 0;
+    uint8_t use_capacitor_sequence_ = 0U;
+    uint8_t decision_sequence_ = 0U;
+    bool decision_drop_log_started_ = false;
+    bool chassis_yaw_stale_ = true;
+    bool capacitor_stale_ = true;
+  };
+
+  struct ChassisState {
+    LibXR::Topic chassis_cmd_topic_;
+    LibXR::Topic yaw_angle_topic_;
+    LibXR::Topic pitch_angle_topic_;
+    LibXR::Topic attitude_topic_;
+    LibXR::Topic use_capacitor_topic_;
+    Referee::LauncherPack local_launcher_pack_{};
+    Referee::RobotGameRefereePack local_sentry_ref_{};
+    uint16_t pending_referee_sources_ = 0U;
+    bool referee_status_pending_ = false;
+    bool launcher_feedback_valid_ = false;
+    Eigen::Matrix<float, 3, 1> local_chassis_gyro_{};
+    bool chassis_gyro_received_ = false;
+    float local_chassis_yaw_ = 0.0F;
+    bool chassis_yaw_valid_ = false;
+    uint32_t local_chassis_yaw_time_ms_ = 0U;
+    SentryDecision::SequenceTracker decision_sequence_tracker_{};
+    uint32_t next_chassis_yaw_tx_ms_ = 0U;
+    uint32_t next_capacitor_tx_ms_ = 0U;
+    uint32_t next_launcher_feedback_tx_ms_ = 0;
+    uint32_t next_referee_status_tx_ms_ = 0U;
+    uint8_t remote_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
+    uint8_t chassis_yaw_sequence_ = 0U;
+    uint8_t capacitor_sequence_ = 0U;
+    uint8_t referee_sequences_[11]{};
+    uint8_t referee_status_sequence_ = 0U;
+  };
+
+  std::conditional_t<ROLE == DualBoardRole::GIMBAL, GimbalState, ChassisState>
+      state_;
 };

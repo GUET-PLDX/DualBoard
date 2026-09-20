@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "RefereeCanCodec.hpp"
+#include "DualBoard.hpp"
 
 namespace {
 

@@ -1,22 +1,24 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
-#include <cmath>
 #include <cstdint>
 #include <limits>
 
-#include "DualBoardControlFrame.hpp"
+#include "DualBoard.hpp"
+
+static_assert(
+    sizeof(DualBoard<DualBoardRole::CHASSIS>) <
+        sizeof(DualBoard<DualBoardRole::GIMBAL>),
+    "Chassis must not carry gimbal receive buffers and decision queues");
 
 namespace {
 
-using Pldx::DualBoardControl::Admission;
-using Pldx::DualBoardControl::AdmissionState;
 using Pldx::DualBoardControl::Command;
 using Pldx::DualBoardControl::Decode;
 using Pldx::DualBoardControl::Encode;
-using Pldx::DualBoardControl::ForceFrame;
 using Pldx::DualBoardControl::Frame;
 using Pldx::DualBoardControl::Mode;
+using Pldx::DualBoardControl::Source;
 
 void ExpectFrame(const Command& command, const Frame& expected) {
   Frame actual{};
@@ -27,16 +29,22 @@ void ExpectFrame(const Command& command, const Frame& expected) {
   assert(Decode(actual, decoded));
   assert(decoded.mode == command.mode);
   assert(decoded.self_define == command.self_define);
-  assert(decoded.si_units == command.si_units);
+  assert(decoded.source == command.source);
 }
 
 void MatchesGoldenVectors() {
-  ExpectFrame({1.0F, -1.0F, 0.5F, 0, Mode::INDEPENDENT, false},
+  Command operator_command{};
+  operator_command.operator_input = {1.0F, -1.0F, 0.5F};
+  operator_command.mode = Mode::INDEPENDENT;
+  ExpectFrame(operator_command,
               {0xFFU, 0x7FU, 0x01U, 0x80U, 0xFFU, 0x3FU, 0x00U, 0x01U});
-  ExpectFrame({2.5F, -2.5F, 1.8F, 0, Mode::INDEPENDENT, true},
-              {0xC4U, 0x09U, 0x3CU, 0xF6U, 0x08U, 0x07U, 0x00U, 0x81U});
-  ExpectFrame({0.0005F, -0.0005F, 0.0015F, 1, Mode::FOLLOW, true},
-              {0x01U, 0x00U, 0xFFU, 0xFFU, 0x02U, 0x00U, 0x01U, 0x83U});
+
+  Command navigation_command{};
+  navigation_command.source = Source::NAVIGATION;
+  navigation_command.navigation_velocity = {1.234F, -2.5F, 5.0F};
+  navigation_command.mode = Mode::NAVIGATION;
+  ExpectFrame(navigation_command,
+              {0xD2U, 0x04U, 0x3CU, 0xF6U, 0x88U, 0x13U, 0x00U, 0x84U});
 }
 
 void RejectsInvalidWireValues() {
@@ -67,81 +75,67 @@ void RejectsInvalidWireValues() {
 
 void EncoderFailsClosed() {
   Frame frame{0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU};
-  Command command{std::numeric_limits<float>::quiet_NaN(),
-                  0.0F,
-                  0.0F,
-                  0,
-                  Mode::INDEPENDENT,
-                  true};
+  Command command{};
+  command.operator_input.x = std::numeric_limits<float>::quiet_NaN();
+  command.mode = Mode::INDEPENDENT;
   assert(!Encode(command, frame));
   assert(frame == Frame{});
 
-  command = {2.5001F, 0.0F, 0.0F, 0, Mode::INDEPENDENT, true};
-  assert(!Encode(command, frame));
-  assert(frame == Frame{});
-
-  command = {2.0F, -2.0F, 0.0F, 0, Mode::INDEPENDENT, false};
+  command = {};
+  command.operator_input = {2.0F, -2.0F, 0.0F};
+  command.mode = Mode::INDEPENDENT;
   assert(Encode(command, frame));
   assert(frame[0] == 0xFFU && frame[1] == 0x7FU);
   assert(frame[2] == 0x01U && frame[3] == 0x80U);
 }
 
-Frame EncodeZero(Mode mode = Mode::INDEPENDENT, bool si_units = true) {
-  Frame frame{};
-  assert(Encode({0.0F, 0.0F, 0.0F, 0, mode, si_units}, frame));
-  return frame;
-}
-
-void RequiresContinuousZeroRearm() {
-  AdmissionState state;
-  const Frame ZERO = EncodeZero();
-  assert(!state.Process(ZERO, 0U).accepted);
-  assert(state.State() == Admission::PROBATION);
-  assert(!state.Process(ZERO, 50U).accepted);
-  const auto ACCEPTED = state.Process(ZERO, 100U);
-  assert(ACCEPTED.accepted);
-  assert(ACCEPTED.admission == Admission::ACCEPTED);
-
-  Frame moving{};
-  assert(Encode({1.0F, 0.0F, 0.0F, 0, Mode::INDEPENDENT, true}, moving));
-  assert(state.Process(moving, 101U).accepted);
-
-  Frame invalid = ZERO;
-  invalid[7] = 0x91U;
-  assert(!state.Process(invalid, 102U).accepted);
-  assert(state.State() == Admission::INVALID);
-  assert(!state.Process(moving, 103U).accepted);
-  assert(state.State() == Admission::INVALID);
-
-  assert(!state.Process(ZERO, 110U).accepted);
-  assert(!state.Process(ZERO, 161U).accepted);
-  assert(!state.Process(ZERO, 211U).accepted);
-  assert(state.Process(ZERO, 261U).accepted);
-}
-
-void HandlesClockWrap() {
-  AdmissionState state;
-  const Frame ZERO = EncodeZero(Mode::RELAX);
-  assert(!state.Process(ZERO, UINT32_MAX - 74U).accepted);
-  assert(!state.Process(ZERO, UINT32_MAX - 24U).accepted);
-  assert(state.Process(ZERO, 25U).accepted);
-}
-
-void ForceFrameRoundTrip() {
+void EnforcesNavigationWireRange() {
   Command command{};
-  command.force_x_global_n = 12.34F;
-  command.force_y_global_n = -5.67F;
-  command.torque_z_global_nm = 3.21F;
-  command.force_control = true;
-  ForceFrame frame{};
-  assert(Pldx::DualBoardControl::EncodeForce(command, frame, 7U));
-  assert(frame[7] == 7U && frame[6] == 1U);
+  command.source = Source::NAVIGATION;
+  command.navigation_velocity.vx_mps = 5.0001F;
+  command.mode = Mode::NAVIGATION;
+  Frame frame{};
+  assert(Encode(command, frame));
+
   Command decoded{};
-  assert(Pldx::DualBoardControl::DecodeForce(frame, decoded));
-  assert(std::fabs(decoded.force_x_global_n - 12.34F) < 0.011F);
-  assert(std::fabs(decoded.force_y_global_n + 5.67F) < 0.011F);
-  assert(std::fabs(decoded.torque_z_global_nm - 3.21F) < 0.011F);
-  assert(decoded.force_control);
+  assert(Decode(frame, decoded));
+  assert(std::fabs(decoded.navigation_velocity.vx_mps - 5.0F) < 0.0011F);
+
+  command.navigation_velocity.vx_mps = 32.768F;
+  assert(!Encode(command, frame));
+}
+
+void UseCapacitorFrameRoundTrip() {
+  Pldx::DualBoardControl::UseCapacitorCommand frame{};
+  assert(Pldx::DualBoardControl::EncodeUseCapacitor(true, 9U, frame));
+  assert(frame.enabled == 1U && frame.sequence == 9U);
+  bool enabled = false;
+  assert(Pldx::DualBoardControl::DecodeUseCapacitor(frame, enabled));
+  assert(enabled);
+
+  assert(Pldx::DualBoardControl::EncodeUseCapacitor(false, 0U, frame));
+  assert(Pldx::DualBoardControl::DecodeUseCapacitor(frame, enabled));
+  assert(!enabled);
+
+  frame.enabled = 2U;
+  assert(!Pldx::DualBoardControl::DecodeUseCapacitor(frame, enabled));
+  frame.enabled = 1U;
+  frame.reserved[0] = 1U;
+  assert(!Pldx::DualBoardControl::DecodeUseCapacitor(frame, enabled));
+}
+
+void SelectsChassisOutputMode() {
+  using Pldx::DualBoardControl::SelectOutputMode;
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, false, true) ==
+         Mode::RELAX);
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, false, false) ==
+         Mode::FOLLOW);
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, true, false) ==
+         Mode::ROTOR);
+  assert(SelectOutputMode(Mode::FOLLOW, false, Mode::ROTOR, true, false) ==
+         Mode::FOLLOW);
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, false, false) ==
+         Mode::FOLLOW);
 }
 
 }  // namespace
@@ -150,7 +144,9 @@ int main() {
   MatchesGoldenVectors();
   RejectsInvalidWireValues();
   EncoderFailsClosed();
-  RequiresContinuousZeroRearm();
-  HandlesClockWrap();
-  ForceFrameRoundTrip();
+  EnforcesNavigationWireRange();
+  UseCapacitorFrameRoundTrip();
+  SelectsChassisOutputMode();
+  static_assert(Pldx::DualBoardControl::RESERVED_MASK == 0x70U);
+  static_assert(Pldx::DualBoardControl::USE_CAPACITOR_ID_OFFSET == 0x11U);
 }

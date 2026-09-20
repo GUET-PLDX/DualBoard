@@ -2,7 +2,7 @@
 set -euo pipefail
 
 HEADER="${1:-DualBoard.hpp}"
-CONTRACT="${SENTRY_DECISION_CONTRACT:-SentryDecisionFrame.hpp}"
+CONTRACT="${SENTRY_DECISION_CONTRACT:-$HEADER}"
 SENTRY_PROTOCOL_HEADER="${SENTRY_PROTOCOL_HEADER:-../SentryProtocol/SentryProtocol.hpp}"
 CHASSIS_YAML="${SENTRY_CHASSIS_YAML:-../../User/RobotConfig/sentry_chassis.yaml}"
 
@@ -42,22 +42,34 @@ need_in "$dispatch_body" 'HandleDecisionFrame\(pack\)' \
   'sentry decision frame handler dispatch'
 
 need 'DECISION_ID_OFFSET = 0x1fU' 'collision-free decision CAN offset'
-need 'SentryDecisionFrame.hpp' 'sentry decision frame contract include'
-need 'struct DecisionUpdate' 'decision callback update payload'
+need 'struct __attribute__\(\(packed\)\) SentryDecisionFrame' 'sentry decision frame contract'
 need 'DECISION_UPDATE_QUEUE_CAPACITY = 32U' \
   'fixed decision update drain budget'
-need_in "$(tr '\n' ' ' <"$HEADER")" \
-  'LibXR::MPMCQueue<DecisionUpdate> decision_updates_\{ *DECISION_UPDATE_QUEUE_CAPACITY\}' \
-  'bounded decision update queue'
+need 'LibXR::SPSCQueue<LibXR::CAN::ClassicPack> rx_frames_' \
+  'SPSC CAN RX queue'
+need 'LibXR::Topic::QueuedSubscriber' 'decision Topic queued subscriber'
+need 'LibXR::SPSCQueue<uint16_t> sentry_buy_bullet_updates_' \
+  'typed buy-bullet SPSC queue'
+need 'LibXR::SPSCQueue<uint8_t> sentry_remote_buy_bullet_updates_' \
+  'typed remote-buy-bullet SPSC queue'
+need 'LibXR::SPSCQueue<uint8_t> sentry_remote_buy_hp_updates_' \
+  'typed remote-buy-hp SPSC queue'
+need 'LibXR::SPSCQueue<bool> sentry_buy_resurrection_updates_' \
+  'typed resurrection SPSC queue'
+need 'LibXR::SPSCQueue<uint8_t> sentry_state_updates_' \
+  'typed state SPSC queue'
 need 'std::atomic<uint32_t> decision_update_drops_\{0\}' \
   'atomic decision update drop counter'
+need 'LibXR::CAN::Type::ERROR' 'classic CAN error subscription'
+need 'GetErrorState' 'LibXR CAN controller error snapshot'
+need 'LibXR::Flag::Atomic can_bus_fault_' 'bus-fault flag'
+need 'bool multi_publisher = false' \
+  'CreateTopic defaults to single-publisher'
 need 'SentryDecisionFrame pending_decision_' 'pending decision frame'
-need 'SentryDecisionFrame active_decision_' 'active decision frame'
 need 'SentryDecision::RetryController decision_retry_' \
   'decision retry controller'
 need 'SentryDecision::SequenceTracker decision_sequence_tracker_' \
   'decision sequence tracker'
-need 'uint32_t last_decision_rx_time_ms_' 'separate decision freshness timestamp'
 
 register_body="$(extract_body RegisterDecisionTopics)"
 register_flat="$(tr '\n' ' ' <<<"$register_body")"
@@ -97,37 +109,32 @@ if [[ -z "$sentry_protocol_line" || -z "$dual_board_line" ||
   echo 'missing: current chassis startup order with SentryProtocol before DualBoard' >&2
   exit 1
 fi
-for callback in OnSentryBuyBullet OnSentryRemoteBuyBullet \
-  OnSentryRemoteBuyHp OnSentryBuyResurrection OnSentryState; do
-  need_in "$register_body" "$callback" "gimbal decision callback: $callback"
-  callback_body="$(extract_body "$callback")"
-  need_in "$callback_body" 'EnqueueDecisionUpdate' \
-    "$callback only enqueues an update"
-  forbid_in "$callback_body" 'pending_decision_|active_decision_|data_mutex_' \
-    "$callback mutates owner-only decision state"
-done
-
-enqueue_body="$(extract_body EnqueueDecisionUpdate)"
-need_in "$enqueue_body" 'decision_updates_\.Push' 'decision update queue push'
-need_in "$enqueue_body" 'decision_update_drops_\.fetch_add' \
-  'observable decision update overflow'
-forbid_in "$enqueue_body" 'pending_decision_|active_decision_|data_mutex_' \
-  'enqueue path mutates owner-only decision state'
+need_in "$register_body" 'RegisterDecisionQueue' \
+  'gimbal decision sources bind queued subscribers'
+register_queue_body="$(extract_body RegisterDecisionQueue)"
+need_in "$register_queue_body" 'LibXR::Topic::QueuedSubscriber' \
+  'decision sources use Topic::QueuedSubscriber'
+need_in "$register_queue_body" 'decision_update_drops_' \
+  'queued subscriber overflow remains observable'
+forbid_in "$register_queue_body" 'pending_decision_|decision_retry_|data_mutex_' \
+  'decision queue registration mutates owner-only decision state'
 
 drain_body="$(extract_body DrainDecisionUpdates)"
 drain_flat="$(tr '\n' ' ' <<<"$drain_body")"
 need_in "$drain_flat" \
   'for \(size_t processed = 0U; processed < DECISION_UPDATE_QUEUE_CAPACITY;' \
   'bounded decision update drain loop'
-need_in "$drain_body" 'decision_updates_\.Pop' 'protocol-thread decision queue drain'
-need_in "$drain_body" '2047U' 'saturating bullet aggregation'
-need_in "$drain_body" '15U' 'saturating remote-count aggregation'
-need_in "$drain_body" 'pending_decision_' 'pending decision aggregation'
+need_in "$drain_body" 'sentry_buy_bullet_updates_\.Pop' \
+  'protocol-thread buy-bullet queue drain'
+need_in "$drain_body" 'sentry_state_updates_\.Pop' \
+  'protocol-thread state queue drain'
+need_in "$drain_body" 'SentryDecision::accumulate' 'protocol-thread decision aggregation'
 
 send_body="$(extract_body SendDecisionFrameIfDue)"
 need_in "$send_body" 'decision_retry_\.Due\(now_ms\)' '10 ms retry scheduling'
-need_in "$send_body" 'SendClassicFrame\(tx_id_ \+ DECISION_ID_OFFSET, active_decision_\)' \
+need_in "$send_body" 'SendClassicFrame\(tx_id_ \+ DECISION_ID_OFFSET,' \
   'decision CAN transmission'
+need_in "$send_body" 'decision_retry_\.Frame\(\)' 'transmit the immutable retry frame'
 need_in "$send_body" 'decision_retry_\.OnSendResult' \
   'successful-send retry accounting'
 
@@ -141,10 +148,8 @@ need 'XR_LOG_WARN' 'decision update overflow warning'
 
 handle_body="$(extract_body HandleDecisionFrame)"
 need_in "$handle_body" 'SentryDecision::Validate\(frame\)' 'decision frame validation'
-need_in "$handle_body" 'last_decision_rx_time_ms_ = now_ms' \
-  'valid decision freshness update'
-need_in "$handle_body" 'decision_sequence_tracker_\.Accept' \
-  'decision sequence deduplication'
+need_in "$handle_body" 'decision_sequence_tracker_\.Accept\(frame.sequence, now_ms\)' \
+  'decision sequence deduplication and freshness'
 forbid_in "$handle_body" 'last_rx_time_ms_|online_|safe_state_published_' \
   'decision traffic mutates motion-link safety state'
 for topic in sentry_buy_bullet_num_topic_ sentry_remote_buy_bullet_times_topic_ \
@@ -178,7 +183,7 @@ if [[ "${SENTRY_DECISION_MUTATION_CHILD:-0}" != "1" ]]; then
     exit 1
   fi
 
-  sed '/void HandleDecisionFrame/,/^  }/ s/last_decision_rx_time_ms_/last_rx_time_ms_/' \
+  sed '/void HandleDecisionFrame/,/^  }/ s/if (!state_.decision_sequence_tracker_/last_rx_time_ms_ = now_ms; if (!state_.decision_sequence_tracker_/' \
     "$HEADER" >"$mutant_dir/motion_timestamp.hpp"
   if SENTRY_DECISION_MUTATION_CHILD=1 bash "$0" \
       "$mutant_dir/motion_timestamp.hpp" >/dev/null 2>&1; then
@@ -186,11 +191,11 @@ if [[ "${SENTRY_DECISION_MUTATION_CHILD:-0}" != "1" ]]; then
     exit 1
   fi
 
-  sed '/void OnSentryState/,/^  }/ s/EnqueueDecisionUpdate/ApplyDecisionUpdate/' \
+  sed '/void RegisterDecisionQueue/,/^  }/ s/QueuedSubscriber/Callback/' \
     "$HEADER" >"$mutant_dir/callback_owner_violation.hpp"
   if SENTRY_DECISION_MUTATION_CHILD=1 bash "$0" \
       "$mutant_dir/callback_owner_violation.hpp" >/dev/null 2>&1; then
-    echo 'mutation survived: callback bypassed decision queue' >&2
+    echo 'mutation survived: decision source bypassed Topic::QueuedSubscriber' >&2
     exit 1
   fi
 
