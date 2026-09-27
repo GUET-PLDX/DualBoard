@@ -78,6 +78,7 @@ enum class Mode : uint8_t {
   ROTOR = 2U,
   FOLLOW = 3U,
   NAVIGATION = 4U,
+  ROTOR_VARIABLE = 5U,
 };
 
 enum class Source : uint8_t {
@@ -116,7 +117,10 @@ struct __attribute__((packed)) UseCapacitorCommand {
 static_assert(sizeof(UseCapacitorCommand) == 8U);
 
 inline bool IsSupportedMode(Mode mode) {
-  return static_cast<uint8_t>(mode) <= static_cast<uint8_t>(Mode::NAVIGATION);
+  /* 上界比较依赖"新模式追加尾部"纪律；追加枚举时须同步此处与 static_assert 组
+   */
+  return static_cast<uint8_t>(mode) <=
+         static_cast<uint8_t>(Mode::ROTOR_VARIABLE);
 }
 
 inline Mode SelectOutputMode(Mode rc_mode, bool nav_valid, Mode nav_mode,
@@ -705,14 +709,6 @@ class DualBoard : public LibXR::Application {
     uint32_t sample_time_ms;
   };
 
-  struct __attribute__((packed)) AttitudeFrame {
-    int16_t roll;
-    int16_t pitch;
-    int16_t yaw;
-    uint8_t sequence;
-    uint8_t reserved;
-  };
-
   struct __attribute__((packed)) LauncherFeedbackFrame {
     uint16_t heat_limit;
     uint16_t cooling_rate;
@@ -747,7 +743,6 @@ class DualBoard : public LibXR::Application {
   static constexpr uint32_t USE_CAPACITOR_ID_OFFSET =
       Pldx::DualBoardControl::USE_CAPACITOR_ID_OFFSET;
   static constexpr uint16_t DECISION_ID_OFFSET = 0x1fU;
-  static constexpr uint32_t ATTITUDE_ID_OFFSET = 0x20U;
   // Bottom-board yaw is sent on 0x330 (chassis tx_id 0x311 + 0x1f).
   static constexpr uint32_t CHASSIS_YAW_ID_OFFSET = 0x1FU;
   static constexpr uint32_t CAPACITOR_ID_OFFSET = 0x1EU;
@@ -778,7 +773,8 @@ class DualBoard : public LibXR::Application {
   static constexpr uint32_t REFEREE_STATUS_PERIOD_MS = 1000U;
   static constexpr uint32_t DECISION_DROP_LOG_PERIOD_MS = 1000U;
   static constexpr size_t DECISION_UPDATE_QUEUE_CAPACITY = 32U;
-  static constexpr uint32_t RX_ID_RANGE = ATTITUDE_ID_OFFSET;
+  /* gimbal→chassis 帧 ID 偏移上界（不含）；当前最大为 DECISION_ID_OFFSET */
+  static constexpr uint32_t RX_ID_RANGE = DECISION_ID_OFFSET + 1U;
   static constexpr float ANGLE_SCALE = 10000.0f;
   static constexpr float ANGLE_LIMIT = 3.2f;
   static constexpr float GYRO_SCALE = 900.0f;
@@ -792,7 +788,6 @@ class DualBoard : public LibXR::Application {
       USE_CAPACITOR_ID_OFFSET != CONTROL_ID_OFFSET &&
           USE_CAPACITOR_ID_OFFSET != ANGLE_ID_OFFSET &&
           USE_CAPACITOR_ID_OFFSET != DECISION_ID_OFFSET &&
-          USE_CAPACITOR_ID_OFFSET != ATTITUDE_ID_OFFSET &&
           USE_CAPACITOR_ID_OFFSET <= RX_ID_RANGE,
       "use_capacitor CAN ID must stay in the gimbal-to-chassis range");
   static_assert(
@@ -805,7 +800,10 @@ class DualBoard : public LibXR::Application {
           static_cast<uint8_t>(ChassisMode::FOLLOW) ==
               static_cast<uint8_t>(Pldx::DualBoardControl::Mode::FOLLOW) &&
           static_cast<uint8_t>(ChassisMode::NAVIGATION) ==
-              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::NAVIGATION),
+              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::NAVIGATION) &&
+          static_cast<uint8_t>(ChassisMode::ROTOR_VARIABLE) ==
+              static_cast<uint8_t>(
+                  Pldx::DualBoardControl::Mode::ROTOR_VARIABLE),
       "DualBoard and chassis modes must use the same wire values");
   static_assert(sizeof(AngleFrame) == 8,
                 "AngleFrame must be one classic CAN frame");
@@ -815,8 +813,6 @@ class DualBoard : public LibXR::Application {
                 "ChassisYawFrame must be one classic CAN frame");
   static_assert(sizeof(CapacitorFrame) == 8,
                 "CapacitorFrame must be one classic CAN frame");
-  static_assert(sizeof(AttitudeFrame) == 8,
-                "AttitudeFrame must be one classic CAN frame");
   static_assert(sizeof(LauncherFeedbackFrame) == 8,
                 "LauncherFeedbackFrame must be one classic CAN frame");
   static_assert(sizeof(RefereeFragmentFrame) == 8,
@@ -914,8 +910,6 @@ class DualBoard : public LibXR::Application {
           "yawmotor_angle");
       RegisterTopicCallback<float, &DualBoard::OnLocalPitchAngle>(
           "pitchmotor_angle");
-      RegisterTopicCallback<LibXR::EulerAngle<float>,
-                            &DualBoard::OnLocalAttitude>("gimbal_euler");
 
       state_.chassis_motion_state_topic_ =
           LibXR::Topic(LibXR::Topic::FindOrCreate<ChassisMotionState>(
@@ -942,8 +936,6 @@ class DualBoard : public LibXR::Application {
       state_.chassis_cmd_topic_ = CreateTopic<CMD::ChassisCMD>("chassis_cmd");
       state_.yaw_angle_topic_ = CreateTopic<float>("yawmotor_angle");
       state_.pitch_angle_topic_ = CreateTopic<float>("pitchmotor_angle");
-      state_.attitude_topic_ =
-          CreateTopic<LibXR::EulerAngle<float>>("gimbal_euler");
 
       RegisterTopicCallback<Referee::LauncherPack,
                             &DualBoard::OnLocalLauncherFeedback>(
@@ -1043,6 +1035,8 @@ class DualBoard : public LibXR::Application {
                                callback);
     dual_board_event_.Register(static_cast<uint32_t>(ChassisMode::NAVIGATION),
                                callback);
+    dual_board_event_.Register(
+        static_cast<uint32_t>(ChassisMode::ROTOR_VARIABLE), callback);
   }
 
   void RegisterCmdEvent() {
@@ -1155,15 +1149,6 @@ class DualBoard : public LibXR::Application {
       state_.local_pitch_angle_ = pitch_angle;
     } else {
       UNUSED(pitch_angle);
-    }
-  }
-
-  void OnLocalAttitude(const LibXR::EulerAngle<float>& attitude) {
-    if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      LibXR::Mutex::LockGuard lock(data_mutex_);
-      state_.local_attitude_ = attitude;
-    } else {
-      UNUSED(attitude);
     }
   }
 
@@ -1495,7 +1480,6 @@ class DualBoard : public LibXR::Application {
       CMD::ChassisCMD command{};
       float yaw_angle = 0.0f;
       float pitch_angle = 0.0f;
-      LibXR::EulerAngle<float> attitude{};
       bool use_capacitor = true;
       Pldx::DualBoardControl::Mode selected_mode =
           Pldx::DualBoardControl::Mode::RELAX;
@@ -1505,7 +1489,6 @@ class DualBoard : public LibXR::Application {
         command = state_.local_chassis_command_;
         yaw_angle = state_.local_yaw_angle_;
         pitch_angle = state_.local_pitch_angle_;
-        attitude = state_.local_attitude_;
         use_capacitor = state_.local_use_capacitor_;
         const bool AUTO_CTRL =
             cmd_ != nullptr && cmd_->GetCtrlMode() == CMD::Mode::CMD_AUTO_CTRL;
@@ -1544,15 +1527,6 @@ class DualBoard : public LibXR::Application {
       angle_frame.pitch = EncodeSigned(pitch_angle, ANGLE_SCALE, ANGLE_LIMIT);
       angle_frame.sequence = state_.tx_sequence_++;
 
-      AttitudeFrame attitude_frame{};
-      attitude_frame.roll =
-          EncodeSigned(attitude.Roll(), ANGLE_SCALE, ANGLE_LIMIT);
-      attitude_frame.pitch =
-          EncodeSigned(attitude.Pitch(), ANGLE_SCALE, ANGLE_LIMIT);
-      attitude_frame.yaw =
-          EncodeSigned(attitude.Yaw(), ANGLE_SCALE, ANGLE_LIMIT);
-      attitude_frame.sequence = angle_frame.sequence;
-
       Pldx::DualBoardControl::UseCapacitorCommand use_capacitor_frame{};
       static_cast<void>(Pldx::DualBoardControl::EncodeUseCapacitor(
           use_capacitor, state_.use_capacitor_sequence_++,
@@ -1560,7 +1534,6 @@ class DualBoard : public LibXR::Application {
 
       SendClassicFrame(tx_id_ + CONTROL_ID_OFFSET, control_frame);
       SendClassicFrame(tx_id_ + ANGLE_ID_OFFSET, angle_frame);
-      SendClassicFrame(tx_id_ + ATTITUDE_ID_OFFSET, attitude_frame);
       SendClassicFrame(tx_id_ + USE_CAPACITOR_ID_OFFSET, use_capacitor_frame);
     }
   }
@@ -1726,8 +1699,6 @@ class DualBoard : public LibXR::Application {
         HandleUseCapacitorFrame(pack);
       } else if (offset == DECISION_ID_OFFSET) {
         HandleDecisionFrame(pack);
-      } else if (offset == ATTITUDE_ID_OFFSET) {
-        HandleAttitudeFrame(pack);
       }
     } else if constexpr (ROLE == DualBoardRole::GIMBAL) {
       if (HandleRefereeFrame(offset, pack)) {
@@ -2077,11 +2048,16 @@ class DualBoard : public LibXR::Application {
       state_.chassis_cmd_topic_.Publish(command);
 
       const uint8_t MODE = static_cast<uint8_t>(decoded.mode);
-      if (restored || state_.remote_mode_ != MODE) {
+      bool mode_mismatch = false;
+      if constexpr (std::is_same_v<ChassisType, Omni>) {
+        mode_mismatch = chassis_ == nullptr ||
+                        static_cast<uint32_t>(chassis_->GetMode()) != MODE;
+      }
+      if (restored || state_.remote_mode_ != MODE || mode_mismatch) {
         uint32_t mode = MODE;
-        mode_topic_.Publish(mode);
-        ForceRemoteMode(mode);
-        state_.remote_mode_ = MODE;
+        if (ForceRemoteMode(mode)) {
+          mode_topic_.Publish(mode);
+        }
       }
     } else {
       UNUSED(pack);
@@ -2100,23 +2076,6 @@ class DualBoard : public LibXR::Application {
       float pitch_angle = DecodeSigned(frame.pitch, ANGLE_SCALE);
       state_.yaw_angle_topic_.Publish(yaw_angle);
       state_.pitch_angle_topic_.Publish(pitch_angle);
-    } else {
-      UNUSED(pack);
-    }
-  }
-
-  void HandleAttitudeFrame(const LibXR::CAN::ClassicPack& pack) {
-    if constexpr (ROLE == DualBoardRole::CHASSIS) {
-      if (!online_) {
-        return;
-      }
-
-      AttitudeFrame frame{};
-      LoadClassicFrame(pack, frame);
-      LibXR::EulerAngle<float> attitude(DecodeSigned(frame.roll, ANGLE_SCALE),
-                                        DecodeSigned(frame.pitch, ANGLE_SCALE),
-                                        DecodeSigned(frame.yaw, ANGLE_SCALE));
-      state_.attitude_topic_.Publish(attitude);
     } else {
       UNUSED(pack);
     }
@@ -2235,7 +2194,8 @@ class DualBoard : public LibXR::Application {
       uint32_t published_mode = mode;
       mode_topic_.Publish(published_mode);
       state_.motion_state_.mode =
-          mode == static_cast<uint8_t>(ChassisMode::ROTOR)
+          (mode == static_cast<uint8_t>(ChassisMode::ROTOR) ||
+           mode == static_cast<uint8_t>(ChassisMode::ROTOR_VARIABLE))
               ? ChassisMotionMode::ROTOR
               : ChassisMotionMode::NON_ROTOR;
       PublishMotionStateLocked();
@@ -2255,24 +2215,31 @@ class DualBoard : public LibXR::Application {
       float zero_angle = 0.0f;
       state_.yaw_angle_topic_.Publish(zero_angle);
       state_.pitch_angle_topic_.Publish(zero_angle);
-      LibXR::EulerAngle<float> attitude{};
-      state_.attitude_topic_.Publish(attitude);
 
       uint32_t mode = static_cast<uint32_t>(ChassisMode::RELAX);
       mode_topic_.Publish(mode);
       ForceRemoteMode(static_cast<uint32_t>(ChassisMode::RELAX));
-      state_.remote_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
     }
   }
 
-  void ForceRemoteMode(uint32_t mode) {
+  bool ForceRemoteMode(uint32_t mode) {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      // 失败时保留未应用标记，让后续相同模式帧继续重试。
+      state_.remote_mode_ = std::numeric_limits<uint8_t>::max();
       if (chassis_ != nullptr) {
         chassis_->GetEvent().Active(mode);
+        if constexpr (std::is_same_v<ChassisType, Omni>) {
+          if (static_cast<uint32_t>(chassis_->GetMode()) != mode) {
+            return false;
+          }
+        }
+        state_.remote_mode_ = static_cast<uint8_t>(mode);
+        return true;
       }
     } else {
       UNUSED(mode);
     }
+    return false;
   }
 
   bool IsSupportedMode(uint32_t mode) const {
@@ -2280,7 +2247,8 @@ class DualBoard : public LibXR::Application {
            mode == static_cast<uint32_t>(ChassisMode::INDEPENDENT) ||
            mode == static_cast<uint32_t>(ChassisMode::ROTOR) ||
            mode == static_cast<uint32_t>(ChassisMode::FOLLOW) ||
-           mode == static_cast<uint32_t>(ChassisMode::NAVIGATION);
+           mode == static_cast<uint32_t>(ChassisMode::NAVIGATION) ||
+           mode == static_cast<uint32_t>(ChassisMode::ROTOR_VARIABLE);
   }
 
   LibXR::CAN* can_;
@@ -2339,7 +2307,6 @@ class DualBoard : public LibXR::Application {
     CMD::ChassisCMD local_chassis_command_{};
     float local_yaw_angle_ = 0.0f;
     float local_pitch_angle_ = 0.0f;
-    LibXR::EulerAngle<float> local_attitude_{};
     uint8_t rc_chassis_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
     uint8_t nav_chassis_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
     uint8_t last_output_chassis_mode_ =
@@ -2373,7 +2340,6 @@ class DualBoard : public LibXR::Application {
     LibXR::Topic chassis_cmd_topic_;
     LibXR::Topic yaw_angle_topic_;
     LibXR::Topic pitch_angle_topic_;
-    LibXR::Topic attitude_topic_;
     LibXR::Topic use_capacitor_topic_;
     Referee::LauncherPack local_launcher_pack_{};
     Referee::RobotGameRefereePack local_sentry_ref_{};

@@ -2,7 +2,7 @@
 
 模块实现、控制帧、裁判分片编解码和哨兵决策协议均位于 `DualBoard.hpp`。其他模块通过 `#include "DualBoard.hpp"` 使用共享类型；主机协议测试位于 `tests/`。
 
-`DualBoard` 是面向 RoboMaster 双主控的定频 CAN 业务帧模块。它保留 LibXR Topic 作为模块边界：上层模块仍发布/订阅 `chassis_cmd`、`yawmotor_angle`、`pitchmotor_angle`、`gimbal_euler`、`launcher_ref` 和 `dualboard_chassis_mode`，但板间物理传输不再转发完整 Topic packet，而是使用固定 8 字节 Classic CAN 帧。
+`DualBoard` 是面向 RoboMaster 双主控的定频 CAN 业务帧模块。它保留 LibXR Topic 作为模块边界：上层模块仍发布/订阅 `chassis_cmd`、`yawmotor_angle`、`pitchmotor_angle`、`launcher_ref` 和 `dualboard_chassis_mode`，但板间物理传输不再转发完整 Topic packet，而是使用固定 8 字节 Classic CAN 帧。
 
 ## 角色
 
@@ -23,7 +23,6 @@
 | `tx_id + 0x00` | 10 ms | 8 | `CMD::ChassisCMD` 的 `x/y/z/self_define` 和底盘模式 |
 | `tx_id + 0x10` | 10 ms | 8 | 云台 yaw/pitch 机械角，`int16` 定点编码 |
 | `tx_id + 0x1f` | 按需 | 8 | Sentry decision；云台板每条 pending decision 至少成功发送 5 次 |
-| `tx_id + 0x20` | 10 ms | 8 | 云台 roll/pitch/yaw 姿态摘要，`int16` 定点编码 |
 
 底盘到云台的 ID 分配：
 
@@ -32,8 +31,8 @@
 | `tx_id + 0x00` | 20 ms | 8 | 发射模块使用的热量上限、冷却、当前热量、弹速和机器人等级 |
 | `tx_id + 0x10` | 10 ms | 8 | `chassis_gyro.z()`，按 900 LSB/(rad/s) 定点编码，含有效标志 |
 
-云台侧 decision 帧使用 `tx_id + 0x1f`（默认云台 ID 为 `0x331`），避开底盘已有的
-`0x327` 裁判帧和云台姿态帧 `0x332`。帧为 `SentryDecisionFrame`：版本、序列号、
+云台侧 decision 帧使用 `tx_id + 0x1f`（默认落在 `0x331`），避开底盘已有的
+`0x327` 裁判帧。帧为 `SentryDecisionFrame`：版本、序列号、
 有效位、状态、购弹增量、远程购弹次数和复活标志均固定在一个 Classic CAN 帧内。
 
 裁判系统固定帧使用底盘发送基址 `0x311`：
@@ -89,7 +88,6 @@ Gimbal -> Chassis：
 - `chassis_cmd`，类型 `CMD::ChassisCMD`
 - `yawmotor_angle`，类型 `float`
 - `pitchmotor_angle`，类型 `float`
-- `gimbal_euler`，类型 `LibXR::EulerAngle<float>`
 - `dualboard_chassis_mode`，类型 `uint32_t`
 - `sentry_buy_bullet_num`，类型 `uint16_t`
 - `sentry_remote_buy_bullet_times`，类型 `uint8_t`
@@ -124,7 +122,7 @@ decision freshness 与运动链路的 `last_rx_time_ms_`、`online_` 和安全�
 
 ## 失联保护
 
-底盘侧超过 `offline_timeout_ms` 未收到控制帧时，会发布零 `chassis_cmd`、零云台角、零姿态，并强制底盘进入 `RELAX`；离线期间收到的 angle/attitude 帧会被丢弃，直到新的 control frame 恢复链路。云台侧由底盘 MotionFrame 或 launcher feedback 刷新同一条链路状态；超过 `offline_timeout_ms` 未收到任一帧时，会发布零 `launcher_ref` 和零 `chassis_gyro_z`，避免继续使用旧裁判摘要或旧底盘角速度。`DualBoard` 同时订阅 `LibXR::CAN::Type::ERROR` 并轮询 `GetErrorState()`：bus-off 或 error-passive 立即按失联处理，不等待业务帧超时。该检查由 `DualBoard` 自身 2 ms 周期线程执行，不依赖全局 `monitor_sleep_ms`。
+底盘侧超过 `offline_timeout_ms` 未收到控制帧时，会发布零 `chassis_cmd`、零云台角，并强制底盘进入 `RELAX`；离线期间收到的 angle 帧会被丢弃，直到新的 control frame 恢复链路。云台侧由底盘 MotionFrame 或 launcher feedback 刷新同一条链路状态；超过 `offline_timeout_ms` 未收到任一帧时，会发布零 `launcher_ref` 和零 `chassis_gyro_z`，避免继续使用旧裁判摘要或旧底盘角速度。`DualBoard` 同时订阅 `LibXR::CAN::Type::ERROR` 并轮询 `GetErrorState()`：bus-off 或 error-passive 立即按失联处理，不等待业务帧超时。该检查由 `DualBoard` 自身 2 ms 周期线程执行，不依赖全局 `monitor_sleep_ms`。
 
 ## 限制
 
