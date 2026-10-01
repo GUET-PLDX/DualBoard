@@ -51,6 +51,7 @@ depends:
 #include "flag.hpp"
 #include "libxr_def.hpp"
 #include "libxr_mem.hpp"
+#include "libxr_time.hpp"
 #include "logger.hpp"
 #include "message.hpp"
 #include "mutex.hpp"
@@ -530,7 +531,8 @@ class SequenceTracker {
  public:
   bool Accept(uint8_t sequence, uint32_t now_ms) {
     if (valid_ && sequence == last_sequence_ &&
-        now_ms - last_rx_ms_ <= RX_TIMEOUT_MS) {
+        (LibXR::MillisecondTimestamp(now_ms) - last_rx_ms_).ToMillisecond() <=
+            RX_TIMEOUT_MS) {
       ObserveDuplicate(now_ms);
       return false;
     }
@@ -546,7 +548,7 @@ class SequenceTracker {
  private:
   bool valid_ = false;
   uint8_t last_sequence_ = 0U;
-  uint32_t last_rx_ms_ = 0U;
+  LibXR::MillisecondTimestamp last_rx_ms_{};
 };
 
 class RetryController {
@@ -566,7 +568,9 @@ class RetryController {
   }
 
   bool Due(uint32_t now_ms) const {
-    return active_ && (now_ms - next_send_ms_) < 0x80000000U;
+    /* 回绕后的差值落在前半周期内视为已到期 */
+    return active_ && (LibXR::MillisecondTimestamp(now_ms) - next_send_ms_)
+                              .ToMillisecond() < DUE_WINDOW_MS;
   }
 
   void OnSendResult(bool sent, uint32_t now_ms) {
@@ -589,10 +593,12 @@ class RetryController {
   const SentryDecisionFrame& Frame() const { return frame_; }
 
  private:
+  static constexpr uint32_t DUE_WINDOW_MS = 0x80000000U;
+
   SentryDecisionFrame frame_{};
   bool active_ = false;
   uint8_t successes_ = 0U;
-  uint32_t next_send_ms_ = 0U;
+  LibXR::MillisecondTimestamp next_send_ms_{};
 };
 
 }  // namespace SentryDecision
@@ -2106,7 +2112,8 @@ class DualBoard : public LibXR::Application {
 
   bool LinkTimedOut(uint32_t now_ms) const {
     return offline_timeout_ms_ != 0U && last_rx_time_ms_ != 0U &&
-           (now_ms - last_rx_time_ms_) > offline_timeout_ms_;
+           (LibXR::MillisecondTimestamp(now_ms) - last_rx_time_ms_)
+                   .ToMillisecond() > offline_timeout_ms_;
   }
 
   void CheckOffline(uint32_t now_ms) {
@@ -2151,9 +2158,9 @@ class DualBoard : public LibXR::Application {
   void PublishInvalidLauncherFeedback() {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
-      const auto now_ms =
-          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-      if ((now_ms - last_rx_time_ms_) <= offline_timeout_ms_) {
+      const LibXR::MillisecondTimestamp NOW =
+          LibXR::Timebase::GetMilliseconds();
+      if ((NOW - last_rx_time_ms_).ToMillisecond() <= offline_timeout_ms_) {
         return;
       }
 
@@ -2283,7 +2290,7 @@ class DualBoard : public LibXR::Application {
   LibXR::Thread protocol_thread_;
   LibXR::Mutex data_mutex_;
   uint32_t next_control_tx_ms_ = 0;
-  uint32_t last_rx_time_ms_ = 0;
+  LibXR::MillisecondTimestamp last_rx_time_ms_{};
   bool online_ = false;
   bool safe_state_published_ = false;
 
