@@ -3,33 +3,11 @@
 // clang-format off
 /* === MODULE MANIFEST V2 ===
 module_description: 双板定频 CAN 业务帧模块，通过 LibXR Topic 保持上层接口并使用 Classic CAN 固定帧同步双板状态
-constructor_args:
-  - can_bus_name: "can2"
-  - tx_id: 0x312
-  - rx_id: 0x311
-  - rx_buffer_size: 256
-  - offline_timeout_ms: 100
-  - chassis: '@nullptr'
-  - mode_topic_name: "dualboard_chassis_mode"
-  - cmd: '@nullptr'
-  - sentry_buy_bullet_num_topic_name: "sentry_buy_bullet_num"
-  - sentry_remote_buy_bullet_times_topic_name: "sentry_remote_buy_bullet_times"
-  - sentry_remote_buy_hp_times_topic_name: "sentry_remote_buy_hp_times"
-  - sentry_buy_resurrection_topic_name: "sentry_buy_resurrection"
-  - sentry_state_topic_name: "sentry_state"
-  - chassis_euler_topic_name: "chassis_euler"
-  - power_control: '@nullptr'
-template_args:
-  - ROLE: DualBoardRole::GIMBAL
-  - ChassisType: Omni
-required_hardware:
-  - can
-
 depends:
-  - pldx/CMD
-  - pldx/Chassis
-  - pldx/PowerControl
-  - pldx/Referee
+- id: GUET-PLDX/CMD
+- id: GUET-PLDX/Chassis
+- id: GUET-PLDX/PowerControl
+- id: GUET-PLDX/Referee
 === END MANIFEST === */
 // clang-format on
 
@@ -46,9 +24,9 @@ depends:
 #include "Chassis.hpp"
 #include "PowerControl.hpp"
 #include "Referee.hpp"
-#include "app_framework.hpp"
 #include "can.hpp"
 #include "flag.hpp"
+#include "libxr.hpp"
 #include "libxr_def.hpp"
 #include "libxr_mem.hpp"
 #include "libxr_time.hpp"
@@ -618,15 +596,13 @@ enum class DualBoardRole : uint8_t {
 };
 
 template <DualBoardRole ROLE, typename ChassisType = Omni>
-class DualBoard : public LibXR::Application {
+class DualBoard {
  public:
   using ChassisMode = typename ChassisType::ChassisMode;
 
   DualBoard(
-      LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-      const char* can_bus_name, uint32_t tx_id, uint32_t rx_id,
-      uint32_t rx_buffer_size, uint32_t offline_timeout_ms,
-      Chassis<ChassisType>* chassis,
+      LibXR::CAN& can, uint32_t tx_id, uint32_t rx_id, uint32_t rx_buffer_size,
+      uint32_t offline_timeout_ms, Chassis<ChassisType>* chassis,
       const char* mode_topic_name = "dualboard_chassis_mode",
       CMD* cmd = nullptr,
       const char* sentry_buy_bullet_num_topic_name = "sentry_buy_bullet_num",
@@ -639,7 +615,7 @@ class DualBoard : public LibXR::Application {
       const char* sentry_state_topic_name = "sentry_state",
       const char* chassis_euler_topic_name = "chassis_euler",
       PowerControl* power_control = nullptr)
-      : can_(hw.template FindOrExit<LibXR::CAN>({can_bus_name})),
+      : can_((&can)),
         tx_id_(tx_id),
         rx_id_(rx_id),
         offline_timeout_ms_(offline_timeout_ms),
@@ -672,11 +648,9 @@ class DualBoard : public LibXR::Application {
                       LibXR::Thread::Priority::MEDIUM);
     protocol_thread_.Create(this, ProtocolThreadEntry, "DualBoardProto", 1536,
                             LibXR::Thread::Priority::MEDIUM);
-
-    app.Register(*this);
   }
 
-  void OnMonitor() override {}
+  void OnMonitor() {}
 
   LibXR::Event& GetEvent() { return dual_board_event_; }
 

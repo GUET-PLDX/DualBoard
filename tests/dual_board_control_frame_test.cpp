@@ -55,7 +55,9 @@ void RejectsInvalidWireValues() {
 
   frame = {};
   frame[7] = 0x04U;
-  assert(!Decode(frame, decoded));
+  assert(Decode(frame, decoded));
+  assert(decoded.mode == Mode::NAVIGATION);
+  assert(decoded.source == Source::OPERATOR);
 
   frame = {};
   frame[6] = 3U;
@@ -70,7 +72,10 @@ void RejectsInvalidWireValues() {
   frame[0] = 0xC5U;
   frame[1] = 0x09U;
   frame[7] = 0x81U;
-  assert(!Decode(frame, decoded));
+  assert(Decode(frame, decoded));
+  assert(decoded.mode == Mode::INDEPENDENT);
+  assert(decoded.source == Source::NAVIGATION);
+  assert(std::fabs(decoded.navigation_velocity.vx_mps - 2.501F) < 0.001F);
 }
 
 void EncoderFailsClosed() {

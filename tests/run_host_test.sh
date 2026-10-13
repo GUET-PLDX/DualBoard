@@ -4,7 +4,7 @@ set -euo pipefail
 test_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 module_dir="$(cd "${test_dir}/.." && pwd)"
 workspace_root="$(cd "${module_dir}/../.." && pwd)"
-libxr_dir="${workspace_root}/Middlewares/Third_Party/LibXR"
+libxr_dir="${workspace_root}/.tooling/LibXR-v2.0.1"
 binary="$(mktemp "${TMPDIR:-/tmp}/dual-board-host-test.XXXXXX")"
 trap 'rm -f "${binary}"' EXIT
 

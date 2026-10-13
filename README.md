@@ -130,3 +130,9 @@ decision freshness 与运动链路的 `last_rx_time_ms_`、`online_` 和安全�
 - `rx_buffer_size` 是 CAN RX `SPSCQueue` 容量。CAN 发送队列深度由 `User/libxr_config.yaml` 的 `CAN.CAN2.queue_size` 配置。
 - 板内 Topic 默认按单发布者创建；只有 `chassis_motion_state` 使用其契约里的 multi-publisher 属性。
 - 裁判数据只走上述固定 CAN2 业务帧；`SharedTopicClient` 不传输 `sentry_ref`。
+
+## LibXR 2.0 静态装配
+
+使用 xrobot 1.0.1 的 `module` / 有序 `args`；构造函数显式注入外设与服务，实例按依赖顺序创建。参数名和顺序以头文件中的构造函数为准，固件示例见 `User/RobotConfig/`。
+
+保留 PLDX 控制、协议、超时与离线保护。 `OnMonitor()` 由生成的监控循环直接调用。
