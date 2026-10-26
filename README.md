@@ -30,6 +30,14 @@
 |---|---:|---:|---|
 | `tx_id + 0x00` | 20 ms | 8 | 发射模块使用的热量上限、冷却、当前热量、弹速和机器人等级 |
 | `tx_id + 0x10` | 10 ms | 8 | `chassis_gyro.z()`，按 900 LSB/(rad/s) 定点编码，含有效标志 |
+| `tx_id + 0x1a` | 4 ms | 8 | `ChassisVelocityFrame`：Omni 轮速正解算的车体系 `vx/vy/wz`（×1000），8 位序号，标志位（有效、四轮在线、模式） |
+
+`0x32B`（`0x311 + 0x1a`）位于裁判位置分片 `0x325-0x32A` 与电容 `0x32F` 之间。
+云台侧解码后补上扩展序号、收帧 µs 时间戳和最近一次底盘陀螺 z，以
+`Pldx::DualBoardControl::ChassisFeedback`（26 B）发布到 `chassis_feedback` topic，
+由 `navigation_tx` 经导航 CDC 送往主机（ros2_libxr 镜像结构为 `wire::ChassisFeedback`）。
+超过 100 ms 未收到该帧时发布一次无效反馈。底盘采样超过 10 ms 未更新时帧内有效位清零。
+测试：`tests/chassis_velocity_frame_test.cpp`（编解码、序号扩展、主机镜像布局）。
 
 云台侧 decision 帧使用 `tx_id + 0x1f`（默认落在 `0x331`），避开底盘已有的
 `0x327` 裁判帧。帧为 `SentryDecisionFrame`：版本、序列号、

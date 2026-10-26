@@ -54,10 +54,8 @@ void RejectsInvalidWireValues() {
   assert(!Decode(frame, decoded));
 
   frame = {};
-  frame[7] = 0x04U;
-  assert(Decode(frame, decoded));
-  assert(decoded.mode == Mode::NAVIGATION);
-  assert(decoded.source == Source::OPERATOR);
+  frame[7] = 0x06U;  // first unsupported mode
+  assert(!Decode(frame, decoded));
 
   frame = {};
   frame[6] = 3U;
@@ -71,11 +69,29 @@ void RejectsInvalidWireValues() {
   frame = {};
   frame[0] = 0xC5U;
   frame[1] = 0x09U;
-  frame[7] = 0x81U;
-  assert(Decode(frame, decoded));
-  assert(decoded.mode == Mode::INDEPENDENT);
-  assert(decoded.source == Source::NAVIGATION);
-  assert(std::fabs(decoded.navigation_velocity.vx_mps - 2.501F) < 0.001F);
+  frame[7] = 0x86U;  // navigation source with an unsupported mode
+  assert(!Decode(frame, decoded));
+}
+
+void SourceAndModeAreIndependent() {
+  for (Mode mode : {Mode::RELAX, Mode::INDEPENDENT, Mode::ROTOR, Mode::FOLLOW,
+                    Mode::NAVIGATION, Mode::ROTOR_VARIABLE}) {
+    for (Source source : {Source::OPERATOR, Source::NAVIGATION}) {
+      Command command{};
+      command.mode = mode;
+      command.source = source;
+      command.operator_input.x = 0.25F;
+      command.navigation_velocity.vx_mps = 2.501F;
+      Frame frame{};
+      assert(Encode(command, frame));
+      Command decoded{};
+      assert(Decode(frame, decoded));
+      assert(decoded.source == source && decoded.mode == mode);
+      if (source == Source::NAVIGATION) {
+        assert(std::fabs(decoded.navigation_velocity.vx_mps - 2.501F) < 0.001F);
+      }
+    }
+  }
 }
 
 void EncoderFailsClosed() {
@@ -148,6 +164,7 @@ void SelectsChassisOutputMode() {
 int main() {
   MatchesGoldenVectors();
   RejectsInvalidWireValues();
+  SourceAndModeAreIndependent();
   EncoderFailsClosed();
   EnforcesNavigationWireRange();
   UseCapacitorFrameRoundTrip();

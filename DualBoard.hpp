@@ -255,6 +255,172 @@ struct ChassisMotionState {
   ChassisMotionMode mode = ChassisMotionMode::NON_ROTOR;
 };
 
+/* 底盘轮速正解算的实测车体系速度（与导航 vx/vy/wz 同轴同号），chassis→gimbal。
+ */
+inline constexpr float CHASSIS_VELOCITY_SCALE = 1000.0F;
+inline constexpr uint8_t CHASSIS_VELOCITY_FLAG_VALID = 0x01U;
+inline constexpr uint8_t CHASSIS_VELOCITY_WHEEL_SHIFT =
+    1U; /* bit1..4 wheel0..3 */
+inline constexpr uint8_t CHASSIS_VELOCITY_MODE_SHIFT = 5U; /* bit5..7 mode */
+
+struct __attribute__((packed)) ChassisVelocityFrame {
+  int16_t vx_q;
+  int16_t vy_q;
+  int16_t wz_q;
+  uint8_t sequence;
+  uint8_t flags;
+};
+static_assert(sizeof(ChassisVelocityFrame) == 8U);
+
+struct ChassisVelocity {
+  NavigationVelocity velocity{};
+  bool valid = false;
+  bool wheel_online[4]{};
+  uint8_t mode = 0U;
+  uint8_t sequence = 0U;
+};
+
+inline bool EncodeChassisVelocity(const ChassisVelocity& input,
+                                  ChassisVelocityFrame& frame) {
+  frame = {};
+  frame.sequence = input.sequence;
+  uint8_t flags =
+      static_cast<uint8_t>((input.mode & 0x07U) << CHASSIS_VELOCITY_MODE_SHIFT);
+  for (uint8_t i = 0; i < 4U; i++) {
+    if (input.wheel_online[i]) {
+      flags |= static_cast<uint8_t>(1U << (CHASSIS_VELOCITY_WHEEL_SHIFT + i));
+    }
+  }
+  const std::array<float, 3U> VALUES{
+      input.velocity.vx_mps, input.velocity.vy_mps, input.velocity.wz_rad_s};
+  constexpr float LIMIT =
+      static_cast<float>(std::numeric_limits<int16_t>::max()) /
+      CHASSIS_VELOCITY_SCALE;
+  bool encodable = input.valid;
+  for (float value : VALUES) {
+    encodable = encodable && std::isfinite(value) && std::fabs(value) <= LIMIT;
+  }
+  if (encodable) {
+    frame.vx_q =
+        static_cast<int16_t>(std::lround(VALUES[0] * CHASSIS_VELOCITY_SCALE));
+    frame.vy_q =
+        static_cast<int16_t>(std::lround(VALUES[1] * CHASSIS_VELOCITY_SCALE));
+    frame.wz_q =
+        static_cast<int16_t>(std::lround(VALUES[2] * CHASSIS_VELOCITY_SCALE));
+    flags |= CHASSIS_VELOCITY_FLAG_VALID;
+  }
+  frame.flags = flags;
+  return encodable;
+}
+
+inline ChassisVelocity DecodeChassisVelocity(
+    const ChassisVelocityFrame& frame) {
+  ChassisVelocity output{};
+  output.sequence = frame.sequence;
+  output.mode =
+      static_cast<uint8_t>(frame.flags >> CHASSIS_VELOCITY_MODE_SHIFT);
+  for (uint8_t i = 0; i < 4U; i++) {
+    output.wheel_online[i] =
+        (frame.flags & (1U << (CHASSIS_VELOCITY_WHEEL_SHIFT + i))) != 0U;
+  }
+  output.valid = (frame.flags & CHASSIS_VELOCITY_FLAG_VALID) != 0U;
+  if (output.valid) {
+    output.velocity.vx_mps =
+        static_cast<float>(frame.vx_q) / CHASSIS_VELOCITY_SCALE;
+    output.velocity.vy_mps =
+        static_cast<float>(frame.vy_q) / CHASSIS_VELOCITY_SCALE;
+    output.velocity.wz_rad_s =
+        static_cast<float>(frame.wz_q) / CHASSIS_VELOCITY_SCALE;
+  }
+  return output;
+}
+
+/* 8 位帧序号扩展为单调 32 位计数；首帧或回绕均按最小正差推进。 */
+inline uint32_t ExtendSequence(uint32_t previous, uint8_t sequence,
+                               bool has_previous) {
+  if (!has_previous) {
+    return sequence;
+  }
+  const uint8_t delta =
+      static_cast<uint8_t>(sequence - static_cast<uint8_t>(previous));
+  return previous + delta;
+}
+
+/* 导航力前馈，gimbal→chassis。与导航 vx/vy 同一坐标系，力 ×100（±327 N），力矩
+ * ×100。 */
+inline constexpr char CHASSIS_FF_TOPIC[] = "chassis_ff";
+inline constexpr float CHASSIS_FF_SCALE = 100.0F;
+inline constexpr uint8_t CHASSIS_FF_FLAG_VALID = 0x01U;
+
+struct __attribute__((packed)) ChassisFeedforwardFrame {
+  int16_t fx_q;
+  int16_t fy_q;
+  int16_t mz_q;
+  uint8_t sequence;
+  uint8_t flags;
+};
+static_assert(sizeof(ChassisFeedforwardFrame) == 8U);
+
+/* 无效或超出量程时整帧置零并清有效位（不截断：超量程说明上游已出错）。 */
+inline bool EncodeChassisFeedforward(const CMD::NavigationFeedforward& input,
+                                     uint8_t sequence,
+                                     ChassisFeedforwardFrame& frame) {
+  frame = {};
+  frame.sequence = sequence;
+  constexpr float LIMIT =
+      static_cast<float>(std::numeric_limits<int16_t>::max()) /
+      CHASSIS_FF_SCALE;
+  const std::array<float, 3U> VALUES{input.fx_n, input.fy_n, input.mz_nm};
+  bool encodable = input.valid;
+  for (float value : VALUES) {
+    encodable = encodable && std::isfinite(value) && std::fabs(value) <= LIMIT;
+  }
+  if (!encodable) {
+    return false;
+  }
+  frame.fx_q = static_cast<int16_t>(std::lround(VALUES[0] * CHASSIS_FF_SCALE));
+  frame.fy_q = static_cast<int16_t>(std::lround(VALUES[1] * CHASSIS_FF_SCALE));
+  frame.mz_q = static_cast<int16_t>(std::lround(VALUES[2] * CHASSIS_FF_SCALE));
+  frame.flags = CHASSIS_FF_FLAG_VALID;
+  return true;
+}
+
+inline CMD::NavigationFeedforward DecodeChassisFeedforward(
+    const ChassisFeedforwardFrame& frame) {
+  CMD::NavigationFeedforward output{};
+  output.valid = (frame.flags & CHASSIS_FF_FLAG_VALID) != 0U;
+  if (output.valid) {
+    output.fx_n = static_cast<float>(frame.fx_q) / CHASSIS_FF_SCALE;
+    output.fy_n = static_cast<float>(frame.fy_q) / CHASSIS_FF_SCALE;
+    output.mz_nm = static_cast<float>(frame.mz_q) / CHASSIS_FF_SCALE;
+  }
+  return output;
+}
+
+/* gimbal → 导航主机（navigation CDC，topic "chassis_feedback"）。
+ * 布局须与 ros2_libxr wire.hpp 的 ChassisFeedback 一致。 */
+inline constexpr const char* CHASSIS_FEEDBACK_TOPIC = "chassis_feedback";
+inline constexpr uint8_t CHASSIS_FEEDBACK_FLAG_VALID = 0x01U;
+inline constexpr uint8_t CHASSIS_FEEDBACK_WHEEL_SHIFT = 1U; /* bit1..4 */
+inline constexpr uint8_t CHASSIS_FEEDBACK_FLAG_LINK = 0x20U;
+inline constexpr uint8_t CHASSIS_FEEDBACK_FLAG_GYRO_VALID = 0x40U;
+
+struct __attribute__((packed)) ChassisFeedback {
+  float vx_mps; /* 轮速正解算，车体系 */
+  float vy_mps;
+  float wz_rad_s;     /* 轮速正解算的偏航角速度 */
+  float gyro_z_rad_s; /* 底盘 IMU 陀螺 z（最近一次 MotionFrame） */
+  uint32_t sequence;  /* 由 CAN 8 位序号扩展；跳号表示 CAN/USB 丢包 */
+  uint32_t stamp_us;  /* 云台板收到 CAN 帧时的 µs 时钟低 32 位 */
+  uint8_t mode;       /* 底盘实际模式（DualBoardControl::Mode 线值） */
+  // bit0 valid; bit1..4 wheel0..3; bit5 link; bit6 gyro valid.
+  uint8_t flags;
+};
+static_assert(sizeof(ChassisFeedback) == 26U);
+static_assert(offsetof(ChassisFeedback, sequence) == 16U);
+static_assert(offsetof(ChassisFeedback, stamp_us) == 20U);
+static_assert(offsetof(ChassisFeedback, flags) == 25U);
+
 }  // namespace Pldx::DualBoardControl
 
 class RefereeCanCodec {
@@ -601,10 +767,11 @@ class DualBoard {
   using ChassisMode = typename ChassisType::ChassisMode;
 
   DualBoard(
-      LibXR::CAN& can, uint32_t tx_id, uint32_t rx_id, uint32_t rx_buffer_size,
-      uint32_t offline_timeout_ms, Chassis<ChassisType>* chassis,
+      LibXR::CAN& can, CMD* cmd, PowerControl* power_control,
+      uint32_t tx_id = 786, uint32_t rx_id = 785, uint32_t rx_buffer_size = 256,
+      uint32_t offline_timeout_ms = 100,
+      Chassis<ChassisType>* chassis = nullptr,
       const char* mode_topic_name = "dualboard_chassis_mode",
-      CMD* cmd = nullptr,
       const char* sentry_buy_bullet_num_topic_name = "sentry_buy_bullet_num",
       const char* sentry_remote_buy_bullet_times_topic_name =
           "sentry_remote_buy_bullet_times",
@@ -613,9 +780,8 @@ class DualBoard {
       const char* sentry_buy_resurrection_topic_name =
           "sentry_buy_resurrection",
       const char* sentry_state_topic_name = "sentry_state",
-      const char* chassis_euler_topic_name = "chassis_euler",
-      PowerControl* power_control = nullptr)
-      : can_((&can)),
+      const char* chassis_euler_topic_name = "chassis_euler")
+      : can_(&can),
         tx_id_(tx_id),
         rx_id_(rx_id),
         offline_timeout_ms_(offline_timeout_ms),
@@ -728,6 +894,15 @@ class DualBoard {
   static constexpr uint32_t CAPACITOR_ID_OFFSET = 0x1EU;
   static constexpr uint32_t CHASSIS_YAW_TIMEOUT_MS = 100U;
   static constexpr uint32_t CAPACITOR_TIMEOUT_MS = 150U;
+  // Measured chassis velocity on 0x32B (chassis tx_id 0x311 + 0x1a), 250 Hz.
+  static constexpr uint32_t CHASSIS_VELOCITY_ID_OFFSET = 0x1AU;
+  static constexpr uint32_t CHASSIS_VELOCITY_PERIOD_MS = 4U;
+  static constexpr uint32_t CHASSIS_VELOCITY_SAMPLE_TIMEOUT_US = 10000U;
+  static constexpr uint32_t CHASSIS_VELOCITY_TIMEOUT_MS = 100U;
+  // Navigation force feedforward on 0x32C (gimbal tx_id 0x312 + 0x1a), 100 Hz.
+  static constexpr uint32_t CHASSIS_FF_ID_OFFSET = 0x1AU;
+  static constexpr uint32_t CHASSIS_FF_PERIOD_MS = 10U;
+  static constexpr uint32_t CHASSIS_FF_SOURCE_TIMEOUT_MS = 30U;
   static constexpr uint32_t REFEREE_GAME_STATUS_ID_OFFSET =
       RefereeCanCodec::GAME_STATUS_ID_OFFSET;
   static constexpr uint32_t REFEREE_FIELD_EVENT_ID_OFFSET =
@@ -803,6 +978,21 @@ class DualBoard {
                 "chassis yaw CAN ID must follow capacitor");
   static_assert(RefereeCanCodec::LINK_STATUS_ID_OFFSET < DECISION_ID_OFFSET,
                 "referee link status CAN ID must stay below decision");
+  // Referee position fragments occupy 0x14..0x19; 0x1a..0x1d are free.
+  static_assert(CHASSIS_VELOCITY_ID_OFFSET >=
+                        RefereeCanCodec::ROBOT_POS_ID_OFFSET + 6U &&
+                    CHASSIS_VELOCITY_ID_OFFSET < CAPACITOR_ID_OFFSET &&
+                    CHASSIS_VELOCITY_ID_OFFSET <= RX_ID_RANGE,
+                "chassis velocity CAN ID must not overlap other frames");
+  // 0x312 + 0x1a = 0x32C: no chassis frame uses 0x311 + 0x1b, and it is inside
+  // the chassis receive filter.
+  static_assert(CHASSIS_FF_ID_OFFSET != CONTROL_ID_OFFSET &&
+                    CHASSIS_FF_ID_OFFSET != ANGLE_ID_OFFSET &&
+                    CHASSIS_FF_ID_OFFSET != USE_CAPACITOR_ID_OFFSET &&
+                    CHASSIS_FF_ID_OFFSET != DECISION_ID_OFFSET &&
+                    CHASSIS_FF_ID_OFFSET + 1U != CHASSIS_VELOCITY_ID_OFFSET &&
+                    CHASSIS_FF_ID_OFFSET <= RX_ID_RANGE,
+                "chassis feedforward CAN ID must not overlap other frames");
 
   static void RxThreadEntry(DualBoard* self) { self->RunRxThread(); }
 
@@ -906,12 +1096,22 @@ class DualBoard {
           CreateTopic<uint8_t>("chassis_capacitor_capacity");
       state_.chassis_capacitor_valid_topic_ =
           CreateTopic<bool>("chassis_capacitor_valid");
+      // Published from the CAN RX thread and the protocol-thread watchdog.
+      state_.chassis_feedback_topic_ =
+          CreateTopic<Pldx::DualBoardControl::ChassisFeedback>(
+              Pldx::DualBoardControl::CHASSIS_FEEDBACK_TOPIC, true);
       CreateTopic<uint32_t>(Pldx::DualBoardControl::NAV_CHASSIS_MODE_TOPIC);
       RegisterTopicCallback<uint32_t, &DualBoard::OnNavChassisMode>(
           Pldx::DualBoardControl::NAV_CHASSIS_MODE_TOPIC);
       CreateTopic<bool>(Pldx::DualBoardControl::USE_CAPACITOR_TOPIC);
       RegisterTopicCallback<bool, &DualBoard::OnLocalUseCapacitor>(
           Pldx::DualBoardControl::USE_CAPACITOR_TOPIC);
+      // HostDataLink publishes it; it may be constructed after this module.
+      LibXR::Topic::FindOrCreate<CMD::NavigationFeedforward>(
+          Pldx::DualBoardControl::CHASSIS_FF_TOPIC, nullptr);
+      RegisterTopicCallback<CMD::NavigationFeedforward,
+                            &DualBoard::OnLocalChassisFeedforward>(
+          Pldx::DualBoardControl::CHASSIS_FF_TOPIC);
     } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
       state_.chassis_cmd_topic_ = CreateTopic<CMD::ChassisCMD>("chassis_cmd");
       state_.yaw_angle_topic_ = CreateTopic<float>("yawmotor_angle");
@@ -929,6 +1129,8 @@ class DualBoard {
           chassis_euler_topic_name_);
       state_.use_capacitor_topic_ =
           CreateTopic<bool>(Pldx::DualBoardControl::USE_CAPACITOR_TOPIC);
+      state_.chassis_ff_topic_ = CreateTopic<CMD::NavigationFeedforward>(
+          Pldx::DualBoardControl::CHASSIS_FF_TOPIC);
     }
   }
 
@@ -1190,6 +1392,17 @@ class DualBoard {
     }
   }
 
+  void OnLocalChassisFeedforward(const CMD::NavigationFeedforward& value) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      state_.local_chassis_ff_ = value;
+      state_.local_chassis_ff_time_ms_ =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+    } else {
+      UNUSED(value);
+    }
+  }
+
   void OnLocalUseCapacitor(const bool& enabled) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
@@ -1251,10 +1464,13 @@ class DualBoard {
         SendDecisionFrameIfDue(now_ms);
         ReportDecisionUpdateDrops(now_ms);
         SendGimbalControlFrames(now_ms);
+        SendChassisFeedforwardFrameIfDue(now_ms);
         CheckChassisYawWatchdog(now_ms);
         CheckCapacitorWatchdog(now_ms);
+        CheckChassisVelocityWatchdog(now_ms);
       } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
         SendMotionFrameIfDue(now_ms);
+        SendChassisVelocityFrameIfDue(now_ms);
         SendChassisYawFrameIfDue(now_ms);
         SendCapacitorFrameIfDue(now_ms);
         SendLauncherFeedbackFrameIfDue(now_ms);
@@ -1425,6 +1641,74 @@ class DualBoard {
       frame.sequence = state_.chassis_yaw_sequence_++;
       frame.sample_time_ms = now_ms;
       SendClassicFrame(tx_id_ + CHASSIS_YAW_ID_OFFSET, frame);
+    }
+  }
+
+  void SendChassisVelocityFrameIfDue(uint32_t now_ms) {
+    if constexpr (ROLE == DualBoardRole::CHASSIS &&
+                  std::is_same_v<ChassisType, Omni>) {
+      if (!IsDue(now_ms, state_.next_chassis_velocity_tx_ms_,
+                 CHASSIS_VELOCITY_PERIOD_MS)) {
+        return;
+      }
+
+      const auto MEASURED = chassis_->GetMeasuredState();
+      const uint64_t NOW_US = LibXR::Timebase::GetMicroseconds();
+      const uint64_t SAMPLE_US = MEASURED.sample_time_us;
+      Pldx::DualBoardControl::ChassisVelocity velocity{};
+      velocity.velocity = {MEASURED.velocity.vx_mps, MEASURED.velocity.vy_mps,
+                           MEASURED.velocity.wz_rad_s};
+      velocity.valid = SAMPLE_US != 0U && NOW_US >= SAMPLE_US &&
+                       NOW_US - SAMPLE_US <= CHASSIS_VELOCITY_SAMPLE_TIMEOUT_US;
+      for (int i = 0; i < 4; i++) {
+        velocity.wheel_online[i] = MEASURED.wheel_online[i];
+      }
+      velocity.mode = static_cast<uint8_t>(MEASURED.mode);
+      velocity.sequence = state_.chassis_velocity_sequence_++;
+
+      Pldx::DualBoardControl::ChassisVelocityFrame frame{};
+      Pldx::DualBoardControl::EncodeChassisVelocity(velocity, frame);
+      SendClassicFrame(tx_id_ + CHASSIS_VELOCITY_ID_OFFSET, frame);
+    } else {
+      UNUSED(now_ms);
+    }
+  }
+
+  void SendChassisFeedforwardFrameIfDue(uint32_t now_ms) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      if (!IsDue(now_ms, state_.next_chassis_ff_tx_ms_, CHASSIS_FF_PERIOD_MS)) {
+        return;
+      }
+      CMD::NavigationFeedforward value{};
+      uint32_t received_ms = 0U;
+      {
+        LibXR::Mutex::LockGuard lock(data_mutex_);
+        value = state_.local_chassis_ff_;
+        received_ms = state_.local_chassis_ff_time_ms_;
+      }
+      // A stale host command must not keep pushing the chassis.
+      if (received_ms == 0U ||
+          now_ms - received_ms > CHASSIS_FF_SOURCE_TIMEOUT_MS) {
+        value = {};
+      }
+      Pldx::DualBoardControl::ChassisFeedforwardFrame frame{};
+      Pldx::DualBoardControl::EncodeChassisFeedforward(
+          value, state_.chassis_ff_sequence_++, frame);
+      SendClassicFrame(tx_id_ + CHASSIS_FF_ID_OFFSET, frame);
+    } else {
+      UNUSED(now_ms);
+    }
+  }
+
+  void HandleChassisFeedforwardFrame(const LibXR::CAN::ClassicPack& pack) {
+    if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      Pldx::DualBoardControl::ChassisFeedforwardFrame frame{};
+      LoadClassicFrame(pack, frame);
+      CMD::NavigationFeedforward value =
+          Pldx::DualBoardControl::DecodeChassisFeedforward(frame);
+      state_.chassis_ff_topic_.Publish(value);
+    } else {
+      UNUSED(pack);
     }
   }
 
@@ -1679,6 +1963,8 @@ class DualBoard {
         HandleUseCapacitorFrame(pack);
       } else if (offset == DECISION_ID_OFFSET) {
         HandleDecisionFrame(pack);
+      } else if (offset == CHASSIS_FF_ID_OFFSET) {
+        HandleChassisFeedforwardFrame(pack);
       }
     } else if constexpr (ROLE == DualBoardRole::GIMBAL) {
       if (HandleRefereeFrame(offset, pack)) {
@@ -1686,6 +1972,8 @@ class DualBoard {
       }
       if (offset == CHASSIS_YAW_ID_OFFSET) {
         HandleChassisYawFrame(pack);
+      } else if (offset == CHASSIS_VELOCITY_ID_OFFSET) {
+        HandleChassisVelocityFrame(pack);
       } else if (offset == CAPACITOR_ID_OFFSET) {
         HandleCapacitorFrame(pack);
       } else if (offset == CONTROL_ID_OFFSET) {
@@ -1962,6 +2250,80 @@ class DualBoard {
       PublishValue(state_.chassis_imu_yaw_topic_, 0.0F);
       PublishValue(state_.chassis_imu_yaw_valid_topic_, false);
       state_.chassis_yaw_stale_ = true;
+    }
+  }
+
+  void HandleChassisVelocityFrame(const LibXR::CAN::ClassicPack& pack) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      Pldx::DualBoardControl::ChassisVelocityFrame frame{};
+      LoadClassicFrame(pack, frame);
+      const auto DECODED = Pldx::DualBoardControl::DecodeChassisVelocity(frame);
+      const auto NOW_US =
+          static_cast<uint64_t>(LibXR::Timebase::GetMicroseconds());
+      const auto NOW_MS =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+
+      Pldx::DualBoardControl::ChassisFeedback feedback{};
+      {
+        LibXR::Mutex::LockGuard lock(data_mutex_);
+        const uint32_t SEQUENCE = Pldx::DualBoardControl::ExtendSequence(
+            state_.chassis_velocity_sequence_, DECODED.sequence,
+            state_.has_chassis_velocity_sequence_);
+        state_.chassis_velocity_sequence_ = SEQUENCE;
+        state_.has_chassis_velocity_sequence_ = true;
+        state_.last_chassis_velocity_rx_ms_ = NOW_MS;
+        state_.chassis_velocity_stale_ = !DECODED.valid;
+
+        feedback.sequence = SEQUENCE;
+        feedback.gyro_z_rad_s = state_.motion_state_.yaw_rate_rad_s;
+        if (state_.motion_state_.yaw_rate_valid) {
+          feedback.flags |=
+              Pldx::DualBoardControl::CHASSIS_FEEDBACK_FLAG_GYRO_VALID;
+        }
+      }
+      feedback.vx_mps = DECODED.velocity.vx_mps;
+      feedback.vy_mps = DECODED.velocity.vy_mps;
+      feedback.wz_rad_s = DECODED.velocity.wz_rad_s;
+      feedback.stamp_us = static_cast<uint32_t>(NOW_US);
+      feedback.mode = DECODED.mode;
+      feedback.flags |= Pldx::DualBoardControl::CHASSIS_FEEDBACK_FLAG_LINK;
+      if (DECODED.valid) {
+        feedback.flags |= Pldx::DualBoardControl::CHASSIS_FEEDBACK_FLAG_VALID;
+      }
+      for (uint8_t i = 0; i < 4U; i++) {
+        if (DECODED.wheel_online[i]) {
+          feedback.flags |= static_cast<uint8_t>(
+              1U << (Pldx::DualBoardControl::CHASSIS_FEEDBACK_WHEEL_SHIFT + i));
+        }
+      }
+      // Publish outside data_mutex_: the navigation CDC client writes in this
+      // call.
+      state_.chassis_feedback_topic_.Publish(feedback);
+    } else {
+      UNUSED(pack);
+    }
+  }
+
+  void CheckChassisVelocityWatchdog(uint32_t now_ms) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      Pldx::DualBoardControl::ChassisFeedback feedback{};
+      {
+        LibXR::Mutex::LockGuard lock(data_mutex_);
+        if (state_.chassis_velocity_stale_ ||
+            (state_.last_chassis_velocity_rx_ms_ != 0U &&
+             now_ms - state_.last_chassis_velocity_rx_ms_ <=
+                 CHASSIS_VELOCITY_TIMEOUT_MS)) {
+          return;
+        }
+        state_.chassis_velocity_stale_ = true;
+        feedback.sequence = state_.chassis_velocity_sequence_;
+      }
+      // Link lost: tell the host explicitly instead of letting it time out.
+      feedback.stamp_us =
+          static_cast<uint32_t>(LibXR::Timebase::GetMicroseconds());
+      state_.chassis_feedback_topic_.Publish(feedback);
+    } else {
+      UNUSED(now_ms);
     }
   }
 
@@ -2274,6 +2636,11 @@ class DualBoard {
     LibXR::Topic chassis_imu_yaw_valid_topic_;
     LibXR::Topic chassis_capacitor_capacity_topic_;
     LibXR::Topic chassis_capacitor_valid_topic_;
+    LibXR::Topic chassis_feedback_topic_;
+    CMD::NavigationFeedforward local_chassis_ff_{};
+    uint32_t local_chassis_ff_time_ms_ = 0U;
+    uint32_t next_chassis_ff_tx_ms_ = 0U;
+    uint8_t chassis_ff_sequence_ = 0U;
     LibXR::SPSCQueue<uint16_t> sentry_buy_bullet_updates_{
         DECISION_UPDATE_QUEUE_CAPACITY};
     LibXR::SPSCQueue<uint8_t> sentry_remote_buy_bullet_updates_{
@@ -2307,6 +2674,10 @@ class DualBoard {
     SentryDecision::RetryController decision_retry_{};
     uint32_t last_chassis_yaw_rx_ms_ = 0U;
     uint32_t last_capacitor_rx_ms_ = 0U;
+    uint32_t last_chassis_velocity_rx_ms_ = 0U;
+    uint32_t chassis_velocity_sequence_ = 0U;
+    bool has_chassis_velocity_sequence_ = false;
+    bool chassis_velocity_stale_ = true;
     uint32_t last_decision_drop_log_ms_ = 0U;
     uint32_t reported_decision_update_drops_ = 0U;
     uint8_t tx_sequence_ = 0;
@@ -2322,6 +2693,7 @@ class DualBoard {
     LibXR::Topic yaw_angle_topic_;
     LibXR::Topic pitch_angle_topic_;
     LibXR::Topic use_capacitor_topic_;
+    LibXR::Topic chassis_ff_topic_;
     Referee::LauncherPack local_launcher_pack_{};
     Referee::RobotGameRefereePack local_sentry_ref_{};
     uint16_t pending_referee_sources_ = 0U;
@@ -2334,11 +2706,13 @@ class DualBoard {
     uint32_t local_chassis_yaw_time_ms_ = 0U;
     SentryDecision::SequenceTracker decision_sequence_tracker_{};
     uint32_t next_chassis_yaw_tx_ms_ = 0U;
+    uint32_t next_chassis_velocity_tx_ms_ = 0U;
     uint32_t next_capacitor_tx_ms_ = 0U;
     uint32_t next_launcher_feedback_tx_ms_ = 0;
     uint32_t next_referee_status_tx_ms_ = 0U;
     uint8_t remote_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
     uint8_t chassis_yaw_sequence_ = 0U;
+    uint8_t chassis_velocity_sequence_ = 0U;
     uint8_t capacitor_sequence_ = 0U;
     uint8_t referee_sequences_[11]{};
     uint8_t referee_status_sequence_ = 0U;
