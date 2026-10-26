@@ -4,10 +4,10 @@
 /* === MODULE MANIFEST V2 ===
 module_description: 双板定频 CAN 业务帧模块，通过 LibXR Topic 保持上层接口并使用 Classic CAN 固定帧同步双板状态
 depends:
-- pldx/CMD@master
-- pldx/Chassis@master
-- pldx/PowerControl@master
-- pldx/Referee@master
+- pldx/CMD@mc02-static
+- pldx/Chassis@mc02-static
+- pldx/PowerControl@mc02-static
+- pldx/Referee@mc02-static
 === END MANIFEST === */
 // clang-format on
 
@@ -413,8 +413,8 @@ struct __attribute__((packed)) ChassisFeedback {
   uint32_t sequence;  /* 由 CAN 8 位序号扩展；跳号表示 CAN/USB 丢包 */
   uint32_t stamp_us;  /* 云台板收到 CAN 帧时的 µs 时钟低 32 位 */
   uint8_t mode;       /* 底盘实际模式（DualBoardControl::Mode 线值） */
-  uint8_t flags; /* bit0 valid，bit1-4 wheel0-3 在线，bit5 链路在线，bit6
-                    陀螺有效 */
+  // bit0 valid; bit1..4 wheel0..3; bit5 link; bit6 gyro valid.
+  uint8_t flags;
 };
 static_assert(sizeof(ChassisFeedback) == 26U);
 static_assert(offsetof(ChassisFeedback, sequence) == 16U);
