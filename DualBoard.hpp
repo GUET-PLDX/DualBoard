@@ -955,10 +955,7 @@ class DualBoard {
           static_cast<uint8_t>(ChassisMode::FOLLOW) ==
               static_cast<uint8_t>(Pldx::DualBoardControl::Mode::FOLLOW) &&
           static_cast<uint8_t>(ChassisMode::NAVIGATION) ==
-              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::NAVIGATION) &&
-          static_cast<uint8_t>(ChassisMode::ROTOR_VARIABLE) ==
-              static_cast<uint8_t>(
-                  Pldx::DualBoardControl::Mode::ROTOR_VARIABLE),
+              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::NAVIGATION),
       "DualBoard and chassis modes must use the same wire values");
   static_assert(sizeof(AngleFrame) == 8,
                 "AngleFrame must be one classic CAN frame");
@@ -1217,8 +1214,6 @@ class DualBoard {
                                callback);
     dual_board_event_.Register(static_cast<uint32_t>(ChassisMode::NAVIGATION),
                                callback);
-    dual_board_event_.Register(
-        static_cast<uint32_t>(ChassisMode::ROTOR_VARIABLE), callback);
   }
 
   void RegisterCmdEvent() {
@@ -2537,8 +2532,7 @@ class DualBoard {
       uint32_t published_mode = mode;
       mode_topic_.Publish(published_mode);
       state_.motion_state_.mode =
-          (mode == static_cast<uint8_t>(ChassisMode::ROTOR) ||
-           mode == static_cast<uint8_t>(ChassisMode::ROTOR_VARIABLE))
+          (mode == static_cast<uint8_t>(ChassisMode::ROTOR))
               ? ChassisMotionMode::ROTOR
               : ChassisMotionMode::NON_ROTOR;
       PublishMotionStateLocked();
@@ -2590,8 +2584,7 @@ class DualBoard {
            mode == static_cast<uint32_t>(ChassisMode::INDEPENDENT) ||
            mode == static_cast<uint32_t>(ChassisMode::ROTOR) ||
            mode == static_cast<uint32_t>(ChassisMode::FOLLOW) ||
-           mode == static_cast<uint32_t>(ChassisMode::NAVIGATION) ||
-           mode == static_cast<uint32_t>(ChassisMode::ROTOR_VARIABLE);
+           mode == static_cast<uint32_t>(ChassisMode::NAVIGATION);
   }
 
   LibXR::CAN* can_;
