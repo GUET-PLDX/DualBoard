@@ -3,7 +3,12 @@ set -euo pipefail
 
 test_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 module_dir="$(cd "${test_dir}/.." && pwd)"
-workspace_root="$(cd "${module_dir}/../.." && pwd)"
+modules_root="$(dirname "${module_dir}")"
+workspace_root="${modules_root}"
+while [[ ! -d "${workspace_root}/Middlewares/Third_Party/LibXR" ]]; do
+  [[ "${workspace_root}" != / ]] || { echo 'LibXR workspace not found' >&2; exit 1; }
+  workspace_root="$(dirname "${workspace_root}")"
+done
 libxr_dir="${workspace_root}/Middlewares/Third_Party/LibXR"
 binary="$(mktemp "${TMPDIR:-/tmp}/dual-board-host-test.XXXXXX")"
 trap 'rm -f "${binary}"' EXIT
@@ -14,7 +19,7 @@ while IFS= read -r directory; do
   includes+=(-isystem "${directory}")
 done < <(find "${libxr_dir}/src" -type d)
 for module in CMD Chassis Motor PowerControl Referee RMMotor SuperPower; do
-  includes+=(-isystem "${workspace_root}/Modules/${module}")
+  includes+=(-isystem "${modules_root}/${module}")
 done
 
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -pedantic \
