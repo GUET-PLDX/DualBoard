@@ -42,8 +42,6 @@ depends:
 namespace Pldx::DualBoardControl {
 
 inline constexpr float NORMALIZED_SCALE = 32767.0F;
-inline constexpr float NAVIGATION_SCALE = 1000.0F;
-inline constexpr float NAVIGATION_WIRE_LIMIT = 32767.0F / NAVIGATION_SCALE;
 inline constexpr uint8_t NAVIGATION_SOURCE_BIT = 1U << 7U;
 inline constexpr uint8_t RESERVED_MASK = 0x70U;
 inline constexpr uint8_t MODE_MASK = 0x0FU;
@@ -71,7 +69,7 @@ struct OperatorInput {
   float z = 0.0F;
 };
 
-struct NavigationVelocity {
+struct PlanarVelocity {
   float vx_mps = 0.0F;
   float vy_mps = 0.0F;
   float wz_rad_s = 0.0F;
@@ -80,7 +78,6 @@ struct NavigationVelocity {
 struct Command {
   Source source = Source::OPERATOR;
   OperatorInput operator_input{};
-  NavigationVelocity navigation_velocity{};
   int8_t self_define = 0;
   Mode mode = Mode::RELAX;
 };
@@ -153,18 +150,6 @@ inline bool DecodeUseCapacitor(const UseCapacitorCommand& frame,
 
 inline Frame SafeFrame() { return {}; }
 
-inline bool NavigationVelocityFinite(const NavigationVelocity& velocity) {
-  return std::isfinite(velocity.vx_mps) && std::isfinite(velocity.vy_mps) &&
-         std::isfinite(velocity.wz_rad_s);
-}
-
-inline bool NavigationVelocityEncodable(const NavigationVelocity& velocity) {
-  return NavigationVelocityFinite(velocity) &&
-         std::fabs(velocity.vx_mps) <= NAVIGATION_WIRE_LIMIT &&
-         std::fabs(velocity.vy_mps) <= NAVIGATION_WIRE_LIMIT &&
-         std::fabs(velocity.wz_rad_s) <= NAVIGATION_WIRE_LIMIT;
-}
-
 inline bool Encode(const Command& command, Frame& frame) {
   frame = SafeFrame();
   if (!IsSupportedMode(command.mode) ||
@@ -173,16 +158,7 @@ inline bool Encode(const Command& command, Frame& frame) {
   }
 
   std::array<int16_t, 3U> encoded{};
-  if (command.source == Source::NAVIGATION) {
-    if (!NavigationVelocityEncodable(command.navigation_velocity)) return false;
-    const std::array<float, 3U> VALUES{command.navigation_velocity.vx_mps,
-                                       command.navigation_velocity.vy_mps,
-                                       command.navigation_velocity.wz_rad_s};
-    for (size_t index = 0U; index < VALUES.size(); ++index) {
-      encoded[index] =
-          static_cast<int16_t>(std::round(VALUES[index] * NAVIGATION_SCALE));
-    }
-  } else {
+  if (command.source == Source::OPERATOR) {
     const std::array<float, 3U> VALUES{command.operator_input.x,
                                        command.operator_input.y,
                                        command.operator_input.z};
@@ -228,13 +204,9 @@ inline bool Decode(const Frame& frame, Command& command) {
   command.source = (MODE_RAW & NAVIGATION_SOURCE_BIT) != 0U ? Source::NAVIGATION
                                                             : Source::OPERATOR;
   if (command.source == Source::NAVIGATION) {
-    command.navigation_velocity.vx_mps =
-        static_cast<float>(RAW[0]) / NAVIGATION_SCALE;
-    command.navigation_velocity.vy_mps =
-        static_cast<float>(RAW[1]) / NAVIGATION_SCALE;
-    command.navigation_velocity.wz_rad_s =
-        static_cast<float>(RAW[2]) / NAVIGATION_SCALE;
-    return NavigationVelocityFinite(command.navigation_velocity);
+    // Navigation carries only mode/source here; the wrench has its own CAN
+    // frame.
+    return RAW[0] == 0 && RAW[1] == 0 && RAW[2] == 0;
   }
   command.operator_input.x = static_cast<float>(RAW[0]) / NORMALIZED_SCALE;
   command.operator_input.y = static_cast<float>(RAW[1]) / NORMALIZED_SCALE;
@@ -273,7 +245,7 @@ struct __attribute__((packed)) ChassisVelocityFrame {
 static_assert(sizeof(ChassisVelocityFrame) == 8U);
 
 struct ChassisVelocity {
-  NavigationVelocity velocity{};
+  PlanarVelocity velocity{};
   bool valid = false;
   bool wheel_online[4]{};
   uint8_t mode = 0U;
@@ -1772,9 +1744,6 @@ class DualBoard {
       wire_command.operator_input = {command.operator_input.x,
                                      command.operator_input.y,
                                      command.operator_input.z};
-      wire_command.navigation_velocity = {command.navigation_velocity.vx_mps,
-                                          command.navigation_velocity.vy_mps,
-                                          command.navigation_velocity.wz_rad_s};
       wire_command.self_define = static_cast<int8_t>(command.self_define);
       wire_command.mode = selected_mode;
       ControlFrame control_frame{};
@@ -2378,9 +2347,6 @@ class DualBoard {
       command.operator_input = {decoded.operator_input.x,
                                 decoded.operator_input.y,
                                 decoded.operator_input.z};
-      command.navigation_velocity = {decoded.navigation_velocity.vx_mps,
-                                     decoded.navigation_velocity.vy_mps,
-                                     decoded.navigation_velocity.wz_rad_s};
       command.self_define = static_cast<CMD::ChasStat>(decoded.self_define);
       state_.chassis_cmd_topic_.Publish(command);
 

@@ -41,10 +41,9 @@ void MatchesGoldenVectors() {
 
   Command navigation_command{};
   navigation_command.source = Source::NAVIGATION;
-  navigation_command.navigation_velocity = {1.234F, -2.5F, 5.0F};
   navigation_command.mode = Mode::NAVIGATION;
   ExpectFrame(navigation_command,
-              {0xD2U, 0x04U, 0x3CU, 0xF6U, 0x88U, 0x13U, 0x00U, 0x84U});
+              {0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x84U});
 }
 
 void RejectsInvalidWireValues() {
@@ -81,14 +80,13 @@ void SourceAndModeAreIndependent() {
       command.mode = mode;
       command.source = source;
       command.operator_input.x = 0.25F;
-      command.navigation_velocity.vx_mps = 2.501F;
       Frame frame{};
       assert(Encode(command, frame));
       Command decoded{};
       assert(Decode(frame, decoded));
       assert(decoded.source == source && decoded.mode == mode);
       if (source == Source::NAVIGATION) {
-        assert(std::fabs(decoded.navigation_velocity.vx_mps - 2.501F) < 0.001F);
+        assert(decoded.operator_input.x == 0.0F);
       }
     }
   }
@@ -110,20 +108,18 @@ void EncoderFailsClosed() {
   assert(frame[2] == 0x01U && frame[3] == 0x80U);
 }
 
-void EnforcesNavigationWireRange() {
+void NavigationCarriesOnlyModeAndSource() {
   Command command{};
   command.source = Source::NAVIGATION;
-  command.navigation_velocity.vx_mps = 5.0001F;
+  command.operator_input = {1.0F, -1.0F, 1.0F};
   command.mode = Mode::NAVIGATION;
   Frame frame{};
   assert(Encode(command, frame));
-
   Command decoded{};
   assert(Decode(frame, decoded));
-  assert(std::fabs(decoded.navigation_velocity.vx_mps - 5.0F) < 0.0011F);
-
-  command.navigation_velocity.vx_mps = 32.768F;
-  assert(!Encode(command, frame));
+  assert(decoded.operator_input.x == 0.0F);
+  frame[0] = 1U;
+  assert(!Decode(frame, decoded));
 }
 
 void UseCapacitorFrameRoundTrip() {
@@ -166,7 +162,7 @@ int main() {
   RejectsInvalidWireValues();
   SourceAndModeAreIndependent();
   EncoderFailsClosed();
-  EnforcesNavigationWireRange();
+  NavigationCarriesOnlyModeAndSource();
   UseCapacitorFrameRoundTrip();
   SelectsChassisOutputMode();
   static_assert(Pldx::DualBoardControl::RESERVED_MASK == 0x70U);
