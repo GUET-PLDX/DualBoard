@@ -42,8 +42,8 @@ depends:
 namespace Pldx::DualBoardControl {
 
 inline constexpr float NORMALIZED_SCALE = 32767.0F;
-inline constexpr uint8_t NAVIGATION_SOURCE_BIT = 1U << 7U;
-inline constexpr uint8_t RESERVED_MASK = 0x70U;
+inline constexpr float CHASSIS_VELOCITY_SCALE = 1000.0F;
+inline constexpr uint8_t RESERVED_MASK = 0xF0U;
 inline constexpr uint8_t MODE_MASK = 0x0FU;
 inline constexpr uint32_t USE_CAPACITOR_ID_OFFSET = 0x11U;
 inline constexpr char NAV_CHASSIS_MODE_TOPIC[] = "nav_chassis_mode";
@@ -58,17 +58,6 @@ enum class Mode : uint8_t {
   ROTOR_VARIABLE = 5U,
 };
 
-enum class Source : uint8_t {
-  OPERATOR = 0U,
-  NAVIGATION = 1U,
-};
-
-struct OperatorInput {
-  float x = 0.0F;
-  float y = 0.0F;
-  float z = 0.0F;
-};
-
 struct PlanarVelocity {
   float vx_mps = 0.0F;
   float vy_mps = 0.0F;
@@ -76,8 +65,9 @@ struct PlanarVelocity {
 };
 
 struct Command {
-  Source source = Source::OPERATOR;
-  OperatorInput operator_input{};
+  float vx = 0.0F;
+  float vy = 0.0F;
+  float wz = 0.0F;
   int8_t self_define = 0;
   Mode mode = Mode::RELAX;
 };
@@ -157,25 +147,22 @@ inline bool Encode(const Command& command, Frame& frame) {
     return false;
   }
 
+  const float SCALE = command.mode == Mode::NAVIGATION ? CHASSIS_VELOCITY_SCALE
+                                                       : NORMALIZED_SCALE;
+  const float LIMIT = 32767.0F / SCALE;
   std::array<int16_t, 3U> encoded{};
-  if (command.source == Source::OPERATOR) {
-    const std::array<float, 3U> VALUES{command.operator_input.x,
-                                       command.operator_input.y,
-                                       command.operator_input.z};
-    for (size_t index = 0U; index < VALUES.size(); ++index) {
-      if (!std::isfinite(VALUES[index])) return false;
-      const float CLAMPED = std::clamp(VALUES[index], -1.0F, 1.0F);
-      encoded[index] = static_cast<int16_t>(CLAMPED * NORMALIZED_SCALE);
-    }
+  const std::array<float, 3U> VALUES{command.vx, command.vy, command.wz};
+  for (size_t index = 0U; index < VALUES.size(); ++index) {
+    if (!std::isfinite(VALUES[index])) return false;
+    encoded[index] =
+        static_cast<int16_t>(std::clamp(VALUES[index], -LIMIT, LIMIT) * SCALE);
   }
 
   StoreSigned(frame, 0U, encoded[0]);
   StoreSigned(frame, 2U, encoded[1]);
   StoreSigned(frame, 4U, encoded[2]);
   frame[6] = static_cast<uint8_t>(command.self_define);
-  frame[7] =
-      static_cast<uint8_t>(command.mode) |
-      (command.source == Source::NAVIGATION ? NAVIGATION_SOURCE_BIT : 0U);
+  frame[7] = static_cast<uint8_t>(command.mode);
   return true;
 }
 
@@ -201,16 +188,11 @@ inline bool Decode(const Frame& frame, Command& command) {
 
   command.self_define = SELF_DEFINE;
   command.mode = MODE;
-  command.source = (MODE_RAW & NAVIGATION_SOURCE_BIT) != 0U ? Source::NAVIGATION
-                                                            : Source::OPERATOR;
-  if (command.source == Source::NAVIGATION) {
-    // Navigation carries only mode/source here; the wrench has its own CAN
-    // frame.
-    return RAW[0] == 0 && RAW[1] == 0 && RAW[2] == 0;
-  }
-  command.operator_input.x = static_cast<float>(RAW[0]) / NORMALIZED_SCALE;
-  command.operator_input.y = static_cast<float>(RAW[1]) / NORMALIZED_SCALE;
-  command.operator_input.z = static_cast<float>(RAW[2]) / NORMALIZED_SCALE;
+  const float SCALE =
+      MODE == Mode::NAVIGATION ? CHASSIS_VELOCITY_SCALE : NORMALIZED_SCALE;
+  command.vx = static_cast<float>(RAW[0]) / SCALE;
+  command.vy = static_cast<float>(RAW[1]) / SCALE;
+  command.wz = static_cast<float>(RAW[2]) / SCALE;
   return true;
 }
 
@@ -229,7 +211,6 @@ struct ChassisMotionState {
 
 /* 底盘轮速正解算的实测车体系速度（与导航 vx/vy/wz 同轴同号），chassis→gimbal。
  */
-inline constexpr float CHASSIS_VELOCITY_SCALE = 1000.0F;
 inline constexpr uint8_t CHASSIS_VELOCITY_FLAG_VALID = 0x01U;
 inline constexpr uint8_t CHASSIS_VELOCITY_WHEEL_SHIFT =
     1U; /* bit1..4 wheel0..3 */
@@ -320,7 +301,6 @@ inline uint32_t ExtendSequence(uint32_t previous, uint8_t sequence,
 
 /* 导航力前馈，gimbal→chassis。与导航 vx/vy 同一坐标系，力 ×100（±327 N），力矩
  * ×100。 */
-inline constexpr char CHASSIS_FF_TOPIC[] = "chassis_ff";
 inline constexpr float CHASSIS_FF_SCALE = 100.0F;
 inline constexpr uint8_t CHASSIS_FF_FLAG_VALID = 0x01U;
 
@@ -334,7 +314,7 @@ struct __attribute__((packed)) ChassisFeedforwardFrame {
 static_assert(sizeof(ChassisFeedforwardFrame) == 8U);
 
 /* 无效或超出量程时整帧置零并清有效位（不截断：超量程说明上游已出错）。 */
-inline bool EncodeChassisFeedforward(const CMD::NavigationFeedforward& input,
+inline bool EncodeChassisFeedforward(const CMD::ChassisCMD& input,
                                      uint8_t sequence,
                                      ChassisFeedforwardFrame& frame) {
   frame = {};
@@ -343,7 +323,7 @@ inline bool EncodeChassisFeedforward(const CMD::NavigationFeedforward& input,
       static_cast<float>(std::numeric_limits<int16_t>::max()) /
       CHASSIS_FF_SCALE;
   const std::array<float, 3U> VALUES{input.fx_n, input.fy_n, input.mz_nm};
-  bool encodable = input.valid;
+  bool encodable = input.ff_valid;
   for (float value : VALUES) {
     encodable = encodable && std::isfinite(value) && std::fabs(value) <= LIMIT;
   }
@@ -357,17 +337,53 @@ inline bool EncodeChassisFeedforward(const CMD::NavigationFeedforward& input,
   return true;
 }
 
-inline CMD::NavigationFeedforward DecodeChassisFeedforward(
+inline CMD::ChassisCMD DecodeChassisFeedforward(
     const ChassisFeedforwardFrame& frame) {
-  CMD::NavigationFeedforward output{};
-  output.valid = (frame.flags & CHASSIS_FF_FLAG_VALID) != 0U;
-  if (output.valid) {
+  CMD::ChassisCMD output{};
+  output.ff_valid = (frame.flags & CHASSIS_FF_FLAG_VALID) != 0U;
+  if (output.ff_valid) {
     output.fx_n = static_cast<float>(frame.fx_q) / CHASSIS_FF_SCALE;
     output.fy_n = static_cast<float>(frame.fy_q) / CHASSIS_FF_SCALE;
     output.mz_nm = static_cast<float>(frame.mz_q) / CHASSIS_FF_SCALE;
   }
   return output;
 }
+
+struct ChassisCommandAssembly {
+  CMD::ChassisCMD command{};
+  uint32_t motion_time_ms = 0U;
+  uint32_t ff_time_ms = 0U;
+  bool motion_seen = false;
+
+  void Motion(const Command& input, uint32_t now) {
+    command.vx = input.vx;
+    command.vy = input.vy;
+    command.wz = input.wz;
+    command.self_define = static_cast<CMD::ChasStat>(input.self_define);
+    motion_time_ms = now;
+    motion_seen = true;
+    Expire(now);
+  }
+
+  void Feedforward(const CMD::ChassisCMD& input, uint32_t now) {
+    command.fx_n = input.fx_n;
+    command.fy_n = input.fy_n;
+    command.mz_nm = input.mz_nm;
+    command.ff_valid = input.ff_valid;
+    ff_time_ms = now;
+  }
+
+  bool Expire(uint32_t now) {
+    if (!command.ff_valid || now - ff_time_ms <= 30U) return false;
+    command.fx_n = command.fy_n = command.mz_nm = 0.0F;
+    command.ff_valid = false;
+    return true;
+  }
+
+  bool MotionFresh(uint32_t now) const {
+    return motion_seen && now - motion_time_ms <= 100U;
+  }
+};
 
 /* gimbal → 导航主机（navigation CDC，topic "chassis_feedback"）。
  * 布局须与 ros2_libxr wire.hpp 的 ChassisFeedback 一致。 */
@@ -1043,8 +1059,8 @@ class DualBoard {
     RegisterDecisionTopics();
 
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      RegisterTopicCallback<CMD::ChassisCMD, &DualBoard::OnLocalChassisCommand>(
-          "chassis_cmd");
+      RegisterTopicCallback<CMD::ChassisControl, &DualBoard::OnLocalControl>(
+          "control_state");
       RegisterTopicCallback<float, &DualBoard::OnLocalYawAngle>(
           "yawmotor_angle");
       RegisterTopicCallback<float, &DualBoard::OnLocalPitchAngle>(
@@ -1075,12 +1091,6 @@ class DualBoard {
       CreateTopic<bool>(Pldx::DualBoardControl::USE_CAPACITOR_TOPIC);
       RegisterTopicCallback<bool, &DualBoard::OnLocalUseCapacitor>(
           Pldx::DualBoardControl::USE_CAPACITOR_TOPIC);
-      // HostDataLink publishes it; it may be constructed after this module.
-      LibXR::Topic::FindOrCreate<CMD::NavigationFeedforward>(
-          Pldx::DualBoardControl::CHASSIS_FF_TOPIC, nullptr);
-      RegisterTopicCallback<CMD::NavigationFeedforward,
-                            &DualBoard::OnLocalChassisFeedforward>(
-          Pldx::DualBoardControl::CHASSIS_FF_TOPIC);
     } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
       state_.chassis_cmd_topic_ = CreateTopic<CMD::ChassisCMD>("chassis_cmd");
       state_.yaw_angle_topic_ = CreateTopic<float>("yawmotor_angle");
@@ -1098,8 +1108,6 @@ class DualBoard {
           chassis_euler_topic_name_);
       state_.use_capacitor_topic_ =
           CreateTopic<bool>(Pldx::DualBoardControl::USE_CAPACITOR_TOPIC);
-      state_.chassis_ff_topic_ = CreateTopic<CMD::NavigationFeedforward>(
-          Pldx::DualBoardControl::CHASSIS_FF_TOPIC);
     }
   }
 
@@ -1274,12 +1282,21 @@ class DualBoard {
     }
   }
 
-  void OnLocalChassisCommand(const CMD::ChassisCMD& command) {
+  void OnLocalControl(const CMD::ChassisControl& control) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
-      state_.local_chassis_command_ = command;
+      state_.local_chassis_command_ = control.command;
+      state_.local_control_ = control;
+      state_.committed_mode_ = Pldx::DualBoardControl::SelectOutputMode(
+          static_cast<Pldx::DualBoardControl::Mode>(state_.rc_chassis_mode_),
+          state_.nav_mode_valid_,
+          static_cast<Pldx::DualBoardControl::Mode>(state_.nav_chassis_mode_),
+          control.mode == CMD::Mode::CMD_AUTO_CTRL && control.ai_chassis_online,
+          !control.rc_online);
+      state_.local_chassis_command_time_ms_ =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
     } else {
-      UNUSED(command);
+      UNUSED(control);
     }
   }
 
@@ -1359,17 +1376,6 @@ class DualBoard {
     }
   }
 
-  void OnLocalChassisFeedforward(const CMD::NavigationFeedforward& value) {
-    if constexpr (ROLE == DualBoardRole::GIMBAL) {
-      LibXR::Mutex::LockGuard lock(data_mutex_);
-      state_.local_chassis_ff_ = value;
-      state_.local_chassis_ff_time_ms_ =
-          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-    } else {
-      UNUSED(value);
-    }
-  }
-
   void OnLocalUseCapacitor(const bool& enabled) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
@@ -1436,6 +1442,13 @@ class DualBoard {
         CheckCapacitorWatchdog(now_ms);
         CheckChassisVelocityWatchdog(now_ms);
       } else if constexpr (ROLE == DualBoardRole::CHASSIS) {
+        {
+          LibXR::Mutex::LockGuard lock(data_mutex_);
+          if (state_.command_assembly_.Expire(now_ms) &&
+              state_.command_assembly_.MotionFresh(now_ms)) {
+            state_.chassis_cmd_topic_.Publish(state_.command_assembly_.command);
+          }
+        }
         SendMotionFrameIfDue(now_ms);
         SendChassisVelocityFrameIfDue(now_ms);
         SendChassisYawFrameIfDue(now_ms);
@@ -1646,16 +1659,17 @@ class DualBoard {
       if (!IsDue(now_ms, state_.next_chassis_ff_tx_ms_, CHASSIS_FF_PERIOD_MS)) {
         return;
       }
-      CMD::NavigationFeedforward value{};
+      CMD::ChassisCMD value{};
       uint32_t received_ms = 0U;
       {
         LibXR::Mutex::LockGuard lock(data_mutex_);
-        value = state_.local_chassis_ff_;
-        received_ms = state_.local_chassis_ff_time_ms_;
+        value = state_.local_chassis_command_;
+        if (state_.output_relax_ || !state_.local_control_.rc_online)
+          value = {};
+        received_ms = state_.local_chassis_command_time_ms_;
       }
       // A stale host command must not keep pushing the chassis.
-      if (received_ms == 0U ||
-          now_ms - received_ms > CHASSIS_FF_SOURCE_TIMEOUT_MS) {
+      if (now_ms - received_ms > CHASSIS_FF_SOURCE_TIMEOUT_MS) {
         value = {};
       }
       Pldx::DualBoardControl::ChassisFeedforwardFrame frame{};
@@ -1671,9 +1685,14 @@ class DualBoard {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
       Pldx::DualBoardControl::ChassisFeedforwardFrame frame{};
       LoadClassicFrame(pack, frame);
-      CMD::NavigationFeedforward value =
-          Pldx::DualBoardControl::DecodeChassisFeedforward(frame);
-      state_.chassis_ff_topic_.Publish(value);
+      const auto NOW =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      state_.command_assembly_.Feedforward(
+          Pldx::DualBoardControl::DecodeChassisFeedforward(frame), NOW);
+      if (state_.command_assembly_.MotionFresh(NOW)) {
+        state_.chassis_cmd_topic_.Publish(state_.command_assembly_.command);
+      }
     } else {
       UNUSED(pack);
     }
@@ -1721,15 +1740,12 @@ class DualBoard {
         yaw_angle = state_.local_yaw_angle_;
         pitch_angle = state_.local_pitch_angle_;
         use_capacitor = state_.local_use_capacitor_;
-        const bool AUTO_CTRL =
-            cmd_ != nullptr && cmd_->GetCtrlMode() == CMD::Mode::CMD_AUTO_CTRL;
-        const bool RC_LOST =
-            state_.output_relax_ || (cmd_ != nullptr && !cmd_->Online());
-        selected_mode = Pldx::DualBoardControl::SelectOutputMode(
-            static_cast<Pldx::DualBoardControl::Mode>(state_.rc_chassis_mode_),
-            state_.nav_mode_valid_,
-            static_cast<Pldx::DualBoardControl::Mode>(state_.nav_chassis_mode_),
-            AUTO_CTRL, RC_LOST);
+        const bool RC_LOST = state_.output_relax_ ||
+                             !state_.local_control_.rc_online ||
+                             now_ms - state_.local_chassis_command_time_ms_ >
+                                 offline_timeout_ms_;
+        selected_mode = RC_LOST ? Pldx::DualBoardControl::Mode::RELAX
+                                : state_.committed_mode_;
         if (RC_LOST) {
           command = {};
         }
@@ -1737,13 +1753,9 @@ class DualBoard {
       }
 
       Pldx::DualBoardControl::Command wire_command{};
-      wire_command.source =
-          command.source == CMD::ChassisCommandSource::NAVIGATION
-              ? Pldx::DualBoardControl::Source::NAVIGATION
-              : Pldx::DualBoardControl::Source::OPERATOR;
-      wire_command.operator_input = {command.operator_input.x,
-                                     command.operator_input.y,
-                                     command.operator_input.z};
+      wire_command.vx = command.vx;
+      wire_command.vy = command.vy;
+      wire_command.wz = command.wz;
       wire_command.self_define = static_cast<int8_t>(command.self_define);
       wire_command.mode = selected_mode;
       ControlFrame control_frame{};
@@ -2339,16 +2351,12 @@ class DualBoard {
       online_ = true;
       safe_state_published_ = false;
 
-      CMD::ChassisCMD command{};
-      command.source =
-          decoded.source == Pldx::DualBoardControl::Source::NAVIGATION
-              ? CMD::ChassisCommandSource::NAVIGATION
-              : CMD::ChassisCommandSource::OPERATOR;
-      command.operator_input = {decoded.operator_input.x,
-                                decoded.operator_input.y,
-                                decoded.operator_input.z};
-      command.self_define = static_cast<CMD::ChasStat>(decoded.self_define);
-      state_.chassis_cmd_topic_.Publish(command);
+      {
+        LibXR::Mutex::LockGuard lock(data_mutex_);
+        state_.command_assembly_.Motion(
+            decoded, static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds()));
+        state_.chassis_cmd_topic_.Publish(state_.command_assembly_.command);
+      }
 
       const uint8_t MODE = static_cast<uint8_t>(decoded.mode);
       bool mode_mismatch = false;
@@ -2511,9 +2519,11 @@ class DualBoard {
 
   void PublishSafeChassisState() {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
-      CMD::ChassisCMD command{};
-      command.self_define = CMD::ChasStat::NONE;
-      state_.chassis_cmd_topic_.Publish(command);
+      {
+        LibXR::Mutex::LockGuard lock(data_mutex_);
+        state_.command_assembly_ = {};
+        state_.chassis_cmd_topic_.Publish(state_.command_assembly_.command);
+      }
 
       float zero_angle = 0.0f;
       state_.yaw_angle_topic_.Publish(zero_angle);
@@ -2596,8 +2606,7 @@ class DualBoard {
     LibXR::Topic chassis_capacitor_capacity_topic_;
     LibXR::Topic chassis_capacitor_valid_topic_;
     LibXR::Topic chassis_feedback_topic_;
-    CMD::NavigationFeedforward local_chassis_ff_{};
-    uint32_t local_chassis_ff_time_ms_ = 0U;
+    uint32_t local_chassis_command_time_ms_ = 0U;
     uint32_t next_chassis_ff_tx_ms_ = 0U;
     uint8_t chassis_ff_sequence_ = 0U;
     LibXR::SPSCQueue<uint16_t> sentry_buy_bullet_updates_{
@@ -2612,6 +2621,9 @@ class DualBoard {
         DECISION_UPDATE_QUEUE_CAPACITY};
     std::atomic<uint32_t> decision_update_drops_{0};
     CMD::ChassisCMD local_chassis_command_{};
+    CMD::ChassisControl local_control_{};
+    Pldx::DualBoardControl::Mode committed_mode_ =
+        Pldx::DualBoardControl::Mode::RELAX;
     float local_yaw_angle_ = 0.0f;
     float local_pitch_angle_ = 0.0f;
     uint8_t rc_chassis_mode_ = static_cast<uint8_t>(ChassisMode::RELAX);
@@ -2648,11 +2660,11 @@ class DualBoard {
   };
 
   struct ChassisState {
+    Pldx::DualBoardControl::ChassisCommandAssembly command_assembly_;
     LibXR::Topic chassis_cmd_topic_;
     LibXR::Topic yaw_angle_topic_;
     LibXR::Topic pitch_angle_topic_;
     LibXR::Topic use_capacitor_topic_;
-    LibXR::Topic chassis_ff_topic_;
     Referee::LauncherPack local_launcher_pack_{};
     Referee::RobotGameRefereePack local_sentry_ref_{};
     uint16_t pending_referee_sources_ = 0U;

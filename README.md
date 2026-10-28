@@ -2,7 +2,7 @@
 
 模块实现、控制帧、裁判分片编解码和哨兵决策协议均位于 `DualBoard.hpp`。其他模块通过 `#include "DualBoard.hpp"` 使用共享类型；主机协议测试位于 `tests/`。
 
-`DualBoard` 是面向 RoboMaster 双主控的定频 CAN 业务帧模块。它保留 LibXR Topic 作为模块边界：上层模块仍发布/订阅 `chassis_cmd`、`yawmotor_angle`、`pitchmotor_angle`、`launcher_ref` 和 `dualboard_chassis_mode`，但板间物理传输不再转发完整 Topic packet，而是使用固定 8 字节 Classic CAN 帧。
+`DualBoard` 是面向 RoboMaster 双主控的定频 CAN 业务帧模块。它保留 LibXR Topic 作为模块边界：上层模块通过 `control_state` 接入云台控制结果，底盘侧发布 `chassis_cmd`，并使用 `yawmotor_angle`、`pitchmotor_angle`、`launcher_ref` 和 `dualboard_chassis_mode`，但板间物理传输不再转发完整 Topic packet，而是使用固定 8 字节 Classic CAN 帧。
 
 ## 角色
 
@@ -20,9 +20,11 @@
 
 | CAN ID | 周期 | DLC | 内容 |
 |---|---:|---:|---|
-| `tx_id + 0x00` | 10 ms | 8 | `CMD::ChassisCMD` 的 `x/y/z/self_define` 和底盘模式 |
+| `tx_id + 0x00` | 10 ms | 8 | `CMD::ChassisCMD` 的 `vx/vy/wz/self_define` 和底盘模式 |
 | `tx_id + 0x10` | 10 ms | 8 | 云台 yaw/pitch 机械角，`int16` 定点编码 |
 | `tx_id + 0x1f` | 按需 | 8 | Sentry decision；云台板每条 pending decision 至少成功发送 5 次 |
+
+运动控制帧前三个 int16 为 `vx/vy/wz`，第 6 字节为自定义模式，第 7 字节低四位为底盘模式，高四位保留且必须为零。NAVIGATION 使用 ×1000 编码（m/s、m/s、rad/s），范围 ±32.767；其他模式使用归一化 ×32767 编码，范围 ±1。复合 `ChassisCMD` 的动力学前馈通过独立力 CAN 帧传输；接收端合并回 `chassis_cmd`，运动和力分别按 100ms、30ms 保鲜。运动帧不会刷新力的到达时间，单独力帧也不会恢复失联运动状态。此版本更改控制帧语义，两块板须配套更新。
 
 底盘到云台的 ID 分配：
 
@@ -93,7 +95,7 @@
 
 Gimbal -> Chassis：
 
-- `chassis_cmd`，类型 `CMD::ChassisCMD`
+- `control_state`，类型 `CMD::ChassisControl`（云台侧输入；底盘侧输出仍为 `chassis_cmd`）
 - `yawmotor_angle`，类型 `float`
 - `pitchmotor_angle`，类型 `float`
 - `dualboard_chassis_mode`，类型 `uint32_t`
@@ -126,7 +128,7 @@ decision freshness，100 ms 没有有效 decision 后允许发送端重启并复
 decision freshness 与运动链路的 `last_rx_time_ms_`、`online_` 和安全状态完全分离，
 缺失 decision 不会放宽运动失联保护。
 
-`GetEvent()` 暴露给 `EventBinder`。云台侧把左拨杆模式和导航模式分开放：`EventBinder` 写入遥控槽，`nav_chassis_mode` 写入导航槽。发送控制帧时按 `CMD` 是否自动档选择输出；遥控失联时输出 `RELAX` 和零指令，但不清掉遥控槽。云台侧只监听 `CMD_EVENT_LOST_CTRL` 做上述强制输出。底盘侧仅在模式变化或链路恢复时调用 `chassis->GetEvent().Active(mode)`，避免 10 ms 周期帧反复重置底盘 PID。
+`GetEvent()` 暴露给 `EventBinder`。云台侧把左拨杆模式和导航模式分开放：`EventBinder` 写入遥控槽，`nav_chassis_mode` 写入导航槽。这些输入只更新待选模式；收到 `control_state` 时，将本次命令与有效模式一起锁存。仅 CMD 自动档且 AI 底盘在线时采用导航槽，AI 断流回退使用遥控模式。协议线程只读取锁存结果，不查询 CMD。遥控失联或控制结果超过 `offline_timeout_ms` 未刷新时输出 `RELAX`、零运动和无效前馈，但不清掉遥控槽；失联事件会立即锁存失能状态。底盘侧仅在模式变化或链路恢复时调用 `chassis->GetEvent().Active(mode)`，避免 10 ms 周期帧反复重置底盘 PID。
 
 ## 失联保护
 

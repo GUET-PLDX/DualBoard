@@ -18,7 +18,6 @@ using Pldx::DualBoardControl::Decode;
 using Pldx::DualBoardControl::Encode;
 using Pldx::DualBoardControl::Frame;
 using Pldx::DualBoardControl::Mode;
-using Pldx::DualBoardControl::Source;
 
 void ExpectFrame(const Command& command, const Frame& expected) {
   Frame actual{};
@@ -29,21 +28,21 @@ void ExpectFrame(const Command& command, const Frame& expected) {
   assert(Decode(actual, decoded));
   assert(decoded.mode == command.mode);
   assert(decoded.self_define == command.self_define);
-  assert(decoded.source == command.source);
 }
 
 void MatchesGoldenVectors() {
   Command operator_command{};
-  operator_command.operator_input = {1.0F, -1.0F, 0.5F};
+  operator_command.vx = 1.0F;
+  operator_command.vy = -1.0F;
+  operator_command.wz = 0.5F;
   operator_command.mode = Mode::INDEPENDENT;
   ExpectFrame(operator_command,
               {0xFFU, 0x7FU, 0x01U, 0x80U, 0xFFU, 0x3FU, 0x00U, 0x01U});
 
   Command navigation_command{};
-  navigation_command.source = Source::NAVIGATION;
   navigation_command.mode = Mode::NAVIGATION;
   ExpectFrame(navigation_command,
-              {0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x84U});
+              {0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x04U});
 }
 
 void RejectsInvalidWireValues() {
@@ -68,57 +67,57 @@ void RejectsInvalidWireValues() {
   frame = {};
   frame[0] = 0xC5U;
   frame[1] = 0x09U;
-  frame[7] = 0x86U;  // navigation source with an unsupported mode
+  frame[7] = 0x86U;  // reserved high bit and unsupported mode
   assert(!Decode(frame, decoded));
 }
 
-void SourceAndModeAreIndependent() {
+void MotionTargetsRoundTrip() {
   for (Mode mode : {Mode::RELAX, Mode::INDEPENDENT, Mode::ROTOR, Mode::FOLLOW,
                     Mode::NAVIGATION, Mode::ROTOR_VARIABLE}) {
-    for (Source source : {Source::OPERATOR, Source::NAVIGATION}) {
-      Command command{};
-      command.mode = mode;
-      command.source = source;
-      command.operator_input.x = 0.25F;
-      Frame frame{};
-      assert(Encode(command, frame));
-      Command decoded{};
-      assert(Decode(frame, decoded));
-      assert(decoded.source == source && decoded.mode == mode);
-      if (source == Source::NAVIGATION) {
-        assert(decoded.operator_input.x == 0.0F);
-      }
-    }
+    Command command{};
+    command.mode = mode;
+    command.vx = mode == Mode::NAVIGATION ? 2.5F : 0.25F;
+    command.vy = -command.vx;
+    command.wz = 0.5F;
+    Frame frame{};
+    assert(Encode(command, frame));
+    Command decoded{};
+    assert(Decode(frame, decoded));
+    assert(decoded.mode == mode);
+    assert(std::abs(decoded.vx - command.vx) < 0.001F);
+    assert(std::abs(decoded.vy - command.vy) < 0.001F);
+    assert(std::abs(decoded.wz - command.wz) < 0.001F);
   }
 }
 
 void EncoderFailsClosed() {
   Frame frame{0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU};
   Command command{};
-  command.operator_input.x = std::numeric_limits<float>::quiet_NaN();
+  command.vx = std::numeric_limits<float>::quiet_NaN();
   command.mode = Mode::INDEPENDENT;
   assert(!Encode(command, frame));
   assert(frame == Frame{});
 
   command = {};
-  command.operator_input = {2.0F, -2.0F, 0.0F};
+  command.vx = 2.0F;
+  command.vy = -2.0F;
   command.mode = Mode::INDEPENDENT;
   assert(Encode(command, frame));
   assert(frame[0] == 0xFFU && frame[1] == 0x7FU);
   assert(frame[2] == 0x01U && frame[3] == 0x80U);
 }
 
-void NavigationCarriesOnlyModeAndSource() {
+void NavigationVelocityGoldenVector() {
   Command command{};
-  command.source = Source::NAVIGATION;
-  command.operator_input = {1.0F, -1.0F, 1.0F};
+  command.vx = 1.5F;
+  command.vy = -2.5F;
+  command.wz = 0.25F;
   command.mode = Mode::NAVIGATION;
+  ExpectFrame(command, {0xDC, 0x05, 0x3C, 0xF6, 0xFA, 0x00, 0x00, 0x04});
   Frame frame{};
   assert(Encode(command, frame));
+  frame[7] |= 0x80U;  // Reserved high bits fail closed.
   Command decoded{};
-  assert(Decode(frame, decoded));
-  assert(decoded.operator_input.x == 0.0F);
-  frame[0] = 1U;
   assert(!Decode(frame, decoded));
 }
 
@@ -160,11 +159,11 @@ void SelectsChassisOutputMode() {
 int main() {
   MatchesGoldenVectors();
   RejectsInvalidWireValues();
-  SourceAndModeAreIndependent();
+  MotionTargetsRoundTrip();
   EncoderFailsClosed();
-  NavigationCarriesOnlyModeAndSource();
+  NavigationVelocityGoldenVector();
   UseCapacitorFrameRoundTrip();
   SelectsChassisOutputMode();
-  static_assert(Pldx::DualBoardControl::RESERVED_MASK == 0x70U);
+  static_assert(Pldx::DualBoardControl::RESERVED_MASK == 0xF0U);
   static_assert(Pldx::DualBoardControl::USE_CAPACITOR_ID_OFFSET == 0x11U);
 }
