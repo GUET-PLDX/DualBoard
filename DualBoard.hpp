@@ -798,10 +798,8 @@ class DualBoard {
     RegisterCmdEvent();
     RegisterCanRx();
 
-    rx_thread_.Create(this, RxThreadEntry, "DualBoardRx", 1536,
-                      LibXR::Thread::Priority::MEDIUM);
-    protocol_thread_.Create(this, ProtocolThreadEntry, "DualBoardProto", 1536,
-                            LibXR::Thread::Priority::MEDIUM);
+    thread_.Create(this, ThreadEntry, "DualBoard", 1536,
+                   LibXR::Thread::Priority::MEDIUM);
   }
 
   void OnMonitor() {}
@@ -979,11 +977,7 @@ class DualBoard {
                     CHASSIS_FF_ID_OFFSET <= RX_ID_RANGE,
                 "chassis feedforward CAN ID must not overlap other frames");
 
-  static void RxThreadEntry(DualBoard* self) { self->RunRxThread(); }
-
-  static void ProtocolThreadEntry(DualBoard* self) {
-    self->RunProtocolThread();
-  }
+  static void ThreadEntry(DualBoard* self) { self->RunThread(); }
 
   static int16_t EncodeSigned(float value, float scale, float limit) {
     value = std::clamp(value, -limit, limit);
@@ -1414,23 +1408,24 @@ class DualBoard {
     }
   }
 
-  void RunRxThread() {
+  void RunThread() {
+    auto last_time = static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds()) -
+                     PROTOCOL_THREAD_PERIOD_MS;
     while (true) {
-      if (rx_sem_.Wait() != LibXR::ErrorCode::OK) {
+      const auto now_ms =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+      const uint32_t elapsed = now_ms - last_time;
+      if (elapsed < PROTOCOL_THREAD_PERIOD_MS) {
+        if (rx_sem_.Wait(PROTOCOL_THREAD_PERIOD_MS - elapsed) ==
+            LibXR::ErrorCode::OK) {
+          LibXR::CAN::ClassicPack pack{};
+          if (rx_frames_.Pop(pack) == LibXR::ErrorCode::OK) {
+            HandleCanFrame(pack);
+          }
+        }
         continue;
       }
-
-      LibXR::CAN::ClassicPack pack{};
-      while (rx_frames_.Pop(pack) == LibXR::ErrorCode::OK) {
-        HandleCanFrame(pack);
-      }
-    }
-  }
-
-  void RunProtocolThread() {
-    auto last_time = LibXR::Timebase::GetMilliseconds();
-    while (true) {
-      auto now_ms = static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+      last_time = now_ms;
 
       if constexpr (ROLE == DualBoardRole::GIMBAL) {
         DrainDecisionUpdates();
@@ -1458,7 +1453,6 @@ class DualBoard {
       }
 
       CheckOffline(now_ms);
-      protocol_thread_.SleepUntil(last_time, PROTOCOL_THREAD_PERIOD_MS);
     }
   }
 
@@ -2591,8 +2585,7 @@ class DualBoard {
   LibXR::Flag::Atomic can_bus_fault_;
   LibXR::SPSCQueue<LibXR::CAN::ClassicPack> rx_frames_;
   LibXR::Semaphore rx_sem_;
-  LibXR::Thread rx_thread_;
-  LibXR::Thread protocol_thread_;
+  LibXR::Thread thread_;
   LibXR::Mutex data_mutex_;
   uint32_t next_control_tx_ms_ = 0;
   LibXR::MillisecondTimestamp last_rx_time_ms_{};
