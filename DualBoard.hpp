@@ -56,6 +56,7 @@ enum class Mode : uint8_t {
   FOLLOW = 3U,
   NAVIGATION = 4U,
   ROTOR_VARIABLE = 5U,
+  NAVIGATION_ROTOR = 6U,
 };
 
 struct PlanarVelocity {
@@ -86,7 +87,7 @@ inline bool IsSupportedMode(Mode mode) {
   /* 上界比较依赖"新模式追加尾部"纪律；追加枚举时须同步此处与 static_assert 组
    */
   return static_cast<uint8_t>(mode) <=
-         static_cast<uint8_t>(Mode::ROTOR_VARIABLE);
+         static_cast<uint8_t>(Mode::NAVIGATION_ROTOR);
 }
 
 inline Mode SelectOutputMode(Mode rc_mode, bool nav_valid, Mode nav_mode,
@@ -147,8 +148,10 @@ inline bool Encode(const Command& command, Frame& frame) {
     return false;
   }
 
-  const float SCALE = command.mode == Mode::NAVIGATION ? CHASSIS_VELOCITY_SCALE
-                                                       : NORMALIZED_SCALE;
+  const float SCALE = (command.mode == Mode::NAVIGATION ||
+                       command.mode == Mode::NAVIGATION_ROTOR)
+                          ? CHASSIS_VELOCITY_SCALE
+                          : NORMALIZED_SCALE;
   const float LIMIT = 32767.0F / SCALE;
   std::array<int16_t, 3U> encoded{};
   const std::array<float, 3U> VALUES{command.vx, command.vy, command.wz};
@@ -189,7 +192,9 @@ inline bool Decode(const Frame& frame, Command& command) {
   command.self_define = SELF_DEFINE;
   command.mode = MODE;
   const float SCALE =
-      MODE == Mode::NAVIGATION ? CHASSIS_VELOCITY_SCALE : NORMALIZED_SCALE;
+      (MODE == Mode::NAVIGATION || MODE == Mode::NAVIGATION_ROTOR)
+          ? CHASSIS_VELOCITY_SCALE
+          : NORMALIZED_SCALE;
   command.vx = static_cast<float>(RAW[0]) / SCALE;
   command.vy = static_cast<float>(RAW[1]) / SCALE;
   command.wz = static_cast<float>(RAW[2]) / SCALE;
@@ -941,7 +946,10 @@ class DualBoard {
           static_cast<uint8_t>(ChassisMode::FOLLOW) ==
               static_cast<uint8_t>(Pldx::DualBoardControl::Mode::FOLLOW) &&
           static_cast<uint8_t>(ChassisMode::NAVIGATION) ==
-              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::NAVIGATION),
+              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::NAVIGATION) &&
+          static_cast<uint8_t>(ChassisMode::NAVIGATION_ROTOR) ==
+              static_cast<uint8_t>(
+                  Pldx::DualBoardControl::Mode::NAVIGATION_ROTOR),
       "DualBoard and chassis modes must use the same wire values");
   static_assert(sizeof(AngleFrame) == 8,
                 "AngleFrame must be one classic CAN frame");
@@ -1188,6 +1196,8 @@ class DualBoard {
                                callback);
     dual_board_event_.Register(static_cast<uint32_t>(ChassisMode::NAVIGATION),
                                callback);
+    dual_board_event_.Register(
+        static_cast<uint32_t>(ChassisMode::NAVIGATION_ROTOR), callback);
   }
 
   void RegisterCmdEvent() {
@@ -2500,7 +2510,8 @@ class DualBoard {
       uint32_t published_mode = mode;
       mode_topic_.Publish(published_mode);
       state_.motion_state_.mode =
-          (mode == static_cast<uint8_t>(ChassisMode::ROTOR))
+          (mode == static_cast<uint8_t>(ChassisMode::ROTOR) ||
+           mode == static_cast<uint8_t>(ChassisMode::NAVIGATION_ROTOR))
               ? ChassisMotionMode::ROTOR
               : ChassisMotionMode::NON_ROTOR;
       PublishMotionStateLocked();
@@ -2554,7 +2565,8 @@ class DualBoard {
            mode == static_cast<uint32_t>(ChassisMode::INDEPENDENT) ||
            mode == static_cast<uint32_t>(ChassisMode::ROTOR) ||
            mode == static_cast<uint32_t>(ChassisMode::FOLLOW) ||
-           mode == static_cast<uint32_t>(ChassisMode::NAVIGATION);
+           mode == static_cast<uint32_t>(ChassisMode::NAVIGATION) ||
+           mode == static_cast<uint32_t>(ChassisMode::NAVIGATION_ROTOR);
   }
 
   LibXR::CAN* can_;

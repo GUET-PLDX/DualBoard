@@ -52,7 +52,7 @@ void RejectsInvalidWireValues() {
   assert(!Decode(frame, decoded));
 
   frame = {};
-  frame[7] = 0x06U;  // first unsupported mode
+  frame[7] = 0x07U;  // first unsupported mode
   assert(!Decode(frame, decoded));
 
   frame = {};
@@ -67,16 +67,19 @@ void RejectsInvalidWireValues() {
   frame = {};
   frame[0] = 0xC5U;
   frame[1] = 0x09U;
-  frame[7] = 0x86U;  // reserved high bit and unsupported mode
+  frame[7] = 0x87U;  // reserved high bit and unsupported mode
   assert(!Decode(frame, decoded));
 }
 
 void MotionTargetsRoundTrip() {
-  for (Mode mode : {Mode::RELAX, Mode::INDEPENDENT, Mode::ROTOR, Mode::FOLLOW,
-                    Mode::NAVIGATION, Mode::ROTOR_VARIABLE}) {
+  for (Mode mode :
+       {Mode::RELAX, Mode::INDEPENDENT, Mode::ROTOR, Mode::FOLLOW,
+        Mode::NAVIGATION, Mode::ROTOR_VARIABLE, Mode::NAVIGATION_ROTOR}) {
     Command command{};
     command.mode = mode;
-    command.vx = mode == Mode::NAVIGATION ? 2.5F : 0.25F;
+    command.vx = (mode == Mode::NAVIGATION || mode == Mode::NAVIGATION_ROTOR)
+                     ? 2.5F
+                     : 0.25F;
     command.vy = -command.vx;
     command.wz = 0.5F;
     Frame frame{};
@@ -114,6 +117,8 @@ void NavigationVelocityGoldenVector() {
   command.wz = 0.25F;
   command.mode = Mode::NAVIGATION;
   ExpectFrame(command, {0xDC, 0x05, 0x3C, 0xF6, 0xFA, 0x00, 0x00, 0x04});
+  command.mode = Mode::NAVIGATION_ROTOR;
+  ExpectFrame(command, {0xDC, 0x05, 0x3C, 0xF6, 0xFA, 0x00, 0x00, 0x06});
   Frame frame{};
   assert(Encode(command, frame));
   frame[7] |= 0x80U;  // Reserved high bits fail closed.
