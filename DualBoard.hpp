@@ -2569,6 +2569,11 @@ class DualBoard {
            mode == static_cast<uint32_t>(ChassisMode::NAVIGATION_ROTOR);
   }
 
+  bool online_ = false;
+  bool safe_state_published_ = false;
+  LibXR::MillisecondTimestamp last_rx_time_ms_{};
+  uint32_t next_control_tx_ms_ = 0;
+
   LibXR::CAN* can_;
   uint32_t tx_id_;
   uint32_t rx_id_;
@@ -2599,10 +2604,6 @@ class DualBoard {
   LibXR::Semaphore rx_sem_;
   LibXR::Thread thread_;
   LibXR::Mutex data_mutex_;
-  uint32_t next_control_tx_ms_ = 0;
-  LibXR::MillisecondTimestamp last_rx_time_ms_{};
-  bool online_ = false;
-  bool safe_state_published_ = false;
 
   struct GimbalState {
     LibXR::Topic chassis_motion_state_topic_;
