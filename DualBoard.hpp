@@ -6,6 +6,7 @@ module_description: 双板定频 CAN 业务帧模块，通过 LibXR Topic 保持
 depends:
 - id: GUET-PLDX/CMD
 - id: GUET-PLDX/Chassis
+  ref: 2f802b09a7e8f3eafb3a0999a788ab81eb4dab35
 - id: GUET-PLDX/PowerControl
 - id: GUET-PLDX/Referee
 === END MANIFEST === */
