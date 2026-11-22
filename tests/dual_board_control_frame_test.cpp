@@ -52,7 +52,7 @@ void RejectsInvalidWireValues() {
   assert(!Decode(frame, decoded));
 
   frame = {};
-  frame[7] = 0x07U;  // first unsupported mode
+  frame[7] = 0x08U;
   assert(!Decode(frame, decoded));
 
   frame = {};
@@ -67,17 +67,19 @@ void RejectsInvalidWireValues() {
   frame = {};
   frame[0] = 0xC5U;
   frame[1] = 0x09U;
-  frame[7] = 0x87U;  // reserved high bit and unsupported mode
+  frame[7] = 0x87U;  // reserved high bit
   assert(!Decode(frame, decoded));
 }
 
 void MotionTargetsRoundTrip() {
   for (Mode mode :
        {Mode::RELAX, Mode::INDEPENDENT, Mode::ROTOR, Mode::FOLLOW,
-        Mode::NAVIGATION, Mode::ROTOR_VARIABLE, Mode::NAVIGATION_ROTOR}) {
+        Mode::NAVIGATION, Mode::ROTOR_VARIABLE, Mode::NAVIGATION_ROTOR,
+        Mode::HOLE}) {
     Command command{};
     command.mode = mode;
-    command.vx = (mode == Mode::NAVIGATION || mode == Mode::NAVIGATION_ROTOR)
+    command.vx = (mode == Mode::NAVIGATION || mode == Mode::NAVIGATION_ROTOR ||
+                  mode == Mode::HOLE)
                      ? 2.5F
                      : 0.25F;
     command.vy = -command.vx;
@@ -119,6 +121,8 @@ void NavigationVelocityGoldenVector() {
   ExpectFrame(command, {0xDC, 0x05, 0x3C, 0xF6, 0xFA, 0x00, 0x00, 0x04});
   command.mode = Mode::NAVIGATION_ROTOR;
   ExpectFrame(command, {0xDC, 0x05, 0x3C, 0xF6, 0xFA, 0x00, 0x00, 0x06});
+  command.mode = Mode::HOLE;
+  ExpectFrame(command, {0xDC, 0x05, 0x3C, 0xF6, 0xFA, 0x00, 0x00, 0x07});
   Frame frame{};
   assert(Encode(command, frame));
   frame[7] |= 0x80U;  // Reserved high bits fail closed.
@@ -155,8 +159,12 @@ void SelectsChassisOutputMode() {
          Mode::ROTOR);
   assert(SelectOutputMode(Mode::FOLLOW, false, Mode::ROTOR, true, false) ==
          Mode::FOLLOW);
-  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, false, false) ==
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::HOLE, false, false) ==
          Mode::FOLLOW);
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::HOLE, true, false) ==
+         Mode::HOLE);
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::HOLE, true, true) ==
+         Mode::RELAX);
 }
 
 }  // namespace
