@@ -105,17 +105,41 @@ void ReassemblesFortyBytePositionPayload() {
          Codec::PushResult::DUPLICATE);
 }
 
+void ReassemblesSentryInfoAndExpiresItIndependently() {
+  Referee::SentryInfo input{};
+  input.current_state = 3U;
+  input.own_mech_state = 1U;
+  input.exchanged_bullet_num = 73U;
+  const auto frames = Codec::Encode(6U, input);
+  static_assert(frames.size() == 1U);
+  Codec::Assembly assembly{};
+  Referee::SentryInfo output{};
+  assert(Codec::Push(assembly, 0U, frames[0], 100U, output) ==
+         Codec::PushResult::COMPLETE);
+  assert(output.current_state == 3U && output.own_mech_state == 1U &&
+         output.exchanged_bullet_num == 73U);
+  Referee::SourceTimes received{};
+  received[11] = 100U;
+  received[3] = 3000U;
+  constexpr uint16_t valid = Referee::SOURCE_SENTRY_INFO | Referee::SOURCE_ROBOT_STATUS;
+  assert(Referee::FreshSourceMask(valid, received, 3100U) == valid);
+  assert(Referee::FreshSourceMask(valid, received, 3101U) == Referee::SOURCE_ROBOT_STATUS);
+  assert(Referee::FreshSourceMask(0U, received, 3100U) == 0U);
+}
+
 }  // namespace
 
 int main() {
   static_assert(Codec::GAME_STATUS_ID_OFFSET == 0x02U);
   static_assert(Codec::ROBOT_HP_ID_OFFSET == 0x04U);
   static_assert(Codec::ROBOT_POS_ID_OFFSET == 0x14U);
-  static_assert(Codec::LINK_STATUS_ID_OFFSET == 0x1EU);
+  static_assert(Codec::SENTRY_INFO_ID_OFFSET == 0x1CU);
+  static_assert(Codec::LINK_STATUS_ID_OFFSET == 0x1DU);
   ReassemblesOnlyAfterAllFragments();
   RejectsMixedSequences();
   IgnoresDuplicateCompletion();
   ExpiresIncompleteGroupAfterTwentyMilliseconds();
   LinkStatusCannotValidateMissingLocalGroups();
   ReassemblesFortyBytePositionPayload();
+  ReassemblesSentryInfoAndExpiresItIndependently();
 }

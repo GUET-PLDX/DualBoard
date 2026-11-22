@@ -429,7 +429,8 @@ class RefereeCanCodec {
   static constexpr uint32_t ROBOT_DAMAGE_ID_OFFSET = 0x13U;
   // Position payload uses six dedicated classic-CAN frames (40 bytes).
   static constexpr uint32_t ROBOT_POS_ID_OFFSET = 0x14U;
-  static constexpr uint32_t LINK_STATUS_ID_OFFSET = 0x1EU;
+  static constexpr uint32_t SENTRY_INFO_ID_OFFSET = 0x1CU;
+  static constexpr uint32_t LINK_STATUS_ID_OFFSET = 0x1DU;
   static constexpr uint32_t REASSEMBLY_TIMEOUT_MS = 20U;
   static constexpr size_t FRAGMENT_DATA_SIZE = 7U;
   // RobotPosForSentry is ten IEEE-754 floats (40 bytes); leave room for the
@@ -914,6 +915,8 @@ class DualBoard {
       RefereeCanCodec::ROBOT_DAMAGE_ID_OFFSET;
   static constexpr uint32_t REFEREE_ROBOT_POS_ID_OFFSET =
       RefereeCanCodec::ROBOT_POS_ID_OFFSET;
+  static constexpr uint32_t REFEREE_SENTRY_INFO_ID_OFFSET =
+      RefereeCanCodec::SENTRY_INFO_ID_OFFSET;
   static constexpr uint32_t REFEREE_LINK_STATUS_ID_OFFSET =
       RefereeCanCodec::LINK_STATUS_ID_OFFSET;
   static constexpr uint32_t REFEREE_STATUS_PERIOD_MS = 1000U;
@@ -967,12 +970,13 @@ class DualBoard {
                 "RefereeLinkStatusFrame must be one classic CAN frame");
   static_assert(CAPACITOR_ID_OFFSET + 1U == CHASSIS_YAW_ID_OFFSET,
                 "chassis yaw CAN ID must follow capacitor");
-  static_assert(RefereeCanCodec::LINK_STATUS_ID_OFFSET < DECISION_ID_OFFSET,
-                "referee link status CAN ID must stay below decision");
-  // Referee position fragments occupy 0x14..0x19; 0x1a..0x1d are free.
+  static_assert(sizeof(Referee::SentryInfo) <= RefereeCanCodec::FRAGMENT_DATA_SIZE);
+  static_assert(CHASSIS_FF_ID_OFFSET + 1U < REFEREE_SENTRY_INFO_ID_OFFSET &&
+                REFEREE_SENTRY_INFO_ID_OFFSET < REFEREE_LINK_STATUS_ID_OFFSET &&
+                REFEREE_LINK_STATUS_ID_OFFSET < CAPACITOR_ID_OFFSET);
   static_assert(CHASSIS_VELOCITY_ID_OFFSET >=
                         RefereeCanCodec::ROBOT_POS_ID_OFFSET + 6U &&
-                    CHASSIS_VELOCITY_ID_OFFSET < CAPACITOR_ID_OFFSET &&
+                    CHASSIS_VELOCITY_ID_OFFSET < REFEREE_SENTRY_INFO_ID_OFFSET &&
                     CHASSIS_VELOCITY_ID_OFFSET <= RX_ID_RANGE,
                 "chassis velocity CAN ID must not overlap other frames");
   // 0x312 + 0x1a = 0x32C: no chassis frame uses 0x311 + 0x1b, and it is inside
@@ -1038,6 +1042,8 @@ class DualBoard {
         return Referee::SOURCE_ROBOT_POS;
       case Referee::CommandID::REF_CMD_ID_ROBOT_POS_TO_SENTRY:
         return Referee::SOURCE_SENTRY_POS;
+      case Referee::CommandID::REF_CMD_ID_SENTRY_DECISION:
+        return Referee::SOURCE_SENTRY_INFO;
       case Referee::CommandID::REF_CMD_ID_ROBOT_BUFF:
         return Referee::SOURCE_ROBOT_BUFF;
       case Referee::CommandID::REF_CMD_ID_ROBOT_DMG:
@@ -1888,6 +1894,10 @@ class DualBoard {
         SendRefereeFragments(REFEREE_RFID_ID_OFFSET,
                              state_.referee_sequences_[9]++, referee_pack.rfid);
       }
+      if ((pending_sources & Referee::SOURCE_SENTRY_INFO) != 0U) {
+        SendRefereeFragments(REFEREE_SENTRY_INFO_ID_OFFSET,
+                             state_.referee_sequences_[11]++, referee_pack.sentry_info);
+      }
 
       const bool STATUS_DUE = IsDue(now_ms, state_.next_referee_status_tx_ms_,
                                     REFEREE_STATUS_PERIOD_MS);
@@ -2043,25 +2053,38 @@ class DualBoard {
           assembly, static_cast<size_t>(offset - base_offset), frame, now_ms,
           output);
       if (result != RefereeCanCodec::PushResult::COMPLETE) return false;
-      state_.local_referee_valid_mask_ |= source_mask;
       if (source_mask == Referee::SOURCE_SENTRY_POS) {
         state_.gimbal_sentry_ref_.sentry_pos_received_time_ms = now_ms;
       } else if (source_mask == Referee::SOURCE_ROBOT_HP) {
         state_.gimbal_sentry_ref_.robot_hp_received_time_ms = now_ms;
       }
-      state_.gimbal_sentry_ref_.source_command_id =
-          static_cast<uint16_t>(command_id);
-      state_.gimbal_sentry_ref_.source_valid_mask =
-          RefereeCanCodec::IntersectValidity(
-              state_.upstream_referee_online_, state_.local_referee_valid_mask_,
-              state_.upstream_referee_valid_mask_,
-              Referee::SUPPORTED_SOURCE_MASK);
-      state_.gimbal_sentry_ref_.referee_online =
-          state_.upstream_referee_online_;
-      sentry_ref_topic_.Publish(state_.gimbal_sentry_ref_);
+      RecordRefereeSource(source_mask, now_ms);
+      PublishGimbalReferee(static_cast<uint16_t>(command_id), now_ms);
       return true;
     }
     return false;
+  }
+
+  void RecordRefereeSource(uint16_t source_mask, uint32_t now_ms) {
+    state_.local_referee_valid_mask_ |= source_mask;
+    for (size_t index = 0; index < state_.referee_source_times_.size(); ++index) {
+      if (source_mask == (1U << index)) {
+        state_.referee_source_times_[index] = now_ms;
+        break;
+      }
+    }
+  }
+
+  void PublishGimbalReferee(uint16_t command_id, uint32_t now_ms) {
+    auto& referee = state_.gimbal_sentry_ref_;
+    referee.source_command_id = command_id;
+    referee.referee_online = state_.upstream_referee_online_;
+    referee.source_valid_mask = RefereeCanCodec::IntersectValidity(
+        referee.referee_online, state_.local_referee_valid_mask_,
+        state_.upstream_referee_valid_mask_, Referee::SUPPORTED_SOURCE_MASK);
+    referee.source_fresh_mask = Referee::FreshSourceMask(
+        referee.source_valid_mask, state_.referee_source_times_, now_ms);
+    sentry_ref_topic_.Publish(referee);
   }
 
   bool HandleRefereeFrame(uint32_t offset,
@@ -2078,16 +2101,7 @@ class DualBoard {
         if (!state_.upstream_referee_online_) {
           state_.local_referee_valid_mask_ = 0U;
         }
-        state_.gimbal_sentry_ref_.source_command_id = 0U;
-        state_.gimbal_sentry_ref_.source_valid_mask =
-            RefereeCanCodec::IntersectValidity(
-                state_.upstream_referee_online_,
-                state_.local_referee_valid_mask_,
-                state_.upstream_referee_valid_mask_,
-                Referee::SUPPORTED_SOURCE_MASK);
-        state_.gimbal_sentry_ref_.referee_online =
-            state_.upstream_referee_online_;
-        sentry_ref_topic_.Publish(state_.gimbal_sentry_ref_);
+        PublishGimbalReferee(0U, now_ms);
         last_rx_time_ms_ = now_ms;
         online_ = true;
         safe_state_published_ = false;
@@ -2108,18 +2122,9 @@ class DualBoard {
         LibXR::Memory::FastCopy(
             &state_.gimbal_sentry_ref_.game_status.stage_remain_time,
             &frame.data[2], sizeof(uint16_t));
-        state_.local_referee_valid_mask_ |= Referee::SOURCE_GAME_STATUS;
-        state_.gimbal_sentry_ref_.source_command_id =
-            static_cast<uint16_t>(Referee::CommandID::REF_CMD_ID_GAME_STATUS);
-        state_.gimbal_sentry_ref_.source_valid_mask =
-            RefereeCanCodec::IntersectValidity(
-                state_.upstream_referee_online_,
-                state_.local_referee_valid_mask_,
-                state_.upstream_referee_valid_mask_,
-                Referee::SUPPORTED_SOURCE_MASK);
-        state_.gimbal_sentry_ref_.referee_online =
-            state_.upstream_referee_online_;
-        sentry_ref_topic_.Publish(state_.gimbal_sentry_ref_);
+        RecordRefereeSource(Referee::SOURCE_GAME_STATUS, now_ms);
+        PublishGimbalReferee(
+            static_cast<uint16_t>(Referee::CommandID::REF_CMD_ID_GAME_STATUS), now_ms);
         last_rx_time_ms_ = now_ms;
         online_ = true;
         safe_state_published_ = false;
@@ -2169,6 +2174,10 @@ class DualBoard {
       HANDLE_REFEREE_GROUP(
           REFEREE_RFID_ID_OFFSET, 1U, state_.referee_assemblies_[9], rfid,
           Referee::SOURCE_RFID, Referee::CommandID::REF_CMD_ID_RFID)
+      HANDLE_REFEREE_GROUP(REFEREE_SENTRY_INFO_ID_OFFSET, 1U,
+                           state_.referee_assemblies_[10], sentry_info,
+                           Referee::SOURCE_SENTRY_INFO,
+                           Referee::CommandID::REF_CMD_ID_SENTRY_DECISION)
 #undef HANDLE_REFEREE_GROUP
     }
     return false;
@@ -2490,6 +2499,7 @@ class DualBoard {
       state_.upstream_referee_online_ = false;
       state_.gimbal_sentry_ref_.source_command_id = 0U;
       state_.gimbal_sentry_ref_.source_valid_mask = 0U;
+      state_.gimbal_sentry_ref_.source_fresh_mask = 0U;
       state_.gimbal_sentry_ref_.referee_online = false;
       sentry_ref_topic_.Publish(state_.gimbal_sentry_ref_);
     }
@@ -2641,7 +2651,8 @@ class DualBoard {
     bool output_mode_published_ = false;
     bool local_use_capacitor_ = true;
     Referee::RobotGameRefereePack gimbal_sentry_ref_{};
-    RefereeAssembly referee_assemblies_[10]{};
+    RefereeAssembly referee_assemblies_[11]{};
+    Referee::SourceTimes referee_source_times_{};
     uint16_t local_referee_valid_mask_ = 0U;
     uint16_t upstream_referee_valid_mask_ = 0U;
     bool upstream_referee_online_ = false;
@@ -2691,7 +2702,7 @@ class DualBoard {
     uint8_t chassis_yaw_sequence_ = 0U;
     uint8_t chassis_velocity_sequence_ = 0U;
     uint8_t capacitor_sequence_ = 0U;
-    uint8_t referee_sequences_[11]{};
+    uint8_t referee_sequences_[12]{};
     uint8_t referee_status_sequence_ = 0U;
   };
 
