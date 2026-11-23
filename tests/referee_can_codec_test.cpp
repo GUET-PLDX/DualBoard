@@ -106,18 +106,31 @@ void ReassemblesFortyBytePositionPayload() {
 }
 
 void ReassemblesSentryInfoAndExpiresItIndependently() {
+  const std::array<uint8_t, 14> referee_payload{
+      0x49U, 0x00U, 0x00U, 0x00U, 0x57U, 0xF3U, 1U, 2U, 3U, 0U, 4U, 5U, 6U, 0U};
   Referee::SentryInfo input{};
-  input.current_state = 3U;
-  input.own_mech_state = 1U;
-  input.exchanged_bullet_num = 73U;
+  static_assert(sizeof(input) == referee_payload.size());
+  LibXR::Memory::FastCopy(&input, referee_payload.data(),
+                          referee_payload.size());
   const auto frames = Codec::Encode(6U, input);
-  static_assert(frames.size() == 1U);
+  static_assert(frames.size() == 2U);
   Codec::Assembly assembly{};
-  Referee::SentryInfo output{};
+  Referee::SentryInfo output{0U, 0x2000U, 0U};
   assert(Codec::Push(assembly, 0U, frames[0], 100U, output) ==
+         Codec::PushResult::INCOMPLETE);
+  assert(output.info_2 == 0x2000U);
+  auto unmatched = frames[1];
+  unmatched.sequence = 7U;
+  assert(Codec::Push(assembly, 1U, unmatched, 101U, output) ==
+         Codec::PushResult::INCOMPLETE);
+  assert(output.info_2 == 0x2000U);
+  assert(Codec::Push(assembly, 1U, frames[1], 102U, output) ==
+         Codec::PushResult::INCOMPLETE);
+  assert(Codec::Push(assembly, 0U, frames[0], 103U, output) ==
          Codec::PushResult::COMPLETE);
-  assert(output.current_state == 3U && output.own_mech_state == 1U &&
-         output.exchanged_bullet_num == 73U);
+  assert(output.info_1 == 73U && output.info_2 == 0xF357U &&
+         output.info_3 == 0x0006050400030201ULL &&
+         output.CurrentStance() == 3U);
   Referee::SourceTimes received{};
   received[11] = 100U;
   received[3] = 3000U;
@@ -127,13 +140,32 @@ void ReassemblesSentryInfoAndExpiresItIndependently() {
   assert(Referee::FreshSourceMask(0U, received, 3100U) == 0U);
 }
 
+void EncodesBasicStanceWithoutOverwritingNeighboringCommandFields() {
+  constexpr std::array<uint8_t, 3> expected_stance_byte{0x35U, 0x55U, 0x75U};
+  for (uint32_t stance = 1U; stance <= 3U; ++stance) {
+    Referee::SentryDecisionData request{};
+    request.buy_bullet_num = 0x123U;
+    request.confirm_resurrection = 1U;
+    request.remote_buy_bullet_times = 8U;
+    request.romote_buy_hp_times = 10U;
+    request.comfirm_mech = 1U;
+    request.current_state = stance;
+    std::array<uint8_t, 4> encoded{};
+    static_assert(sizeof(request) == encoded.size());
+    LibXR::Memory::FastCopy(encoded.data(), &request, encoded.size());
+    assert((encoded == std::array<uint8_t, 4>{0x8DU, 0x04U,
+                                              expected_stance_byte[stance - 1U],
+                                              0x01U}));
+  }
+}
+
 }  // namespace
 
 int main() {
   static_assert(Codec::GAME_STATUS_ID_OFFSET == 0x02U);
   static_assert(Codec::ROBOT_HP_ID_OFFSET == 0x04U);
   static_assert(Codec::ROBOT_POS_ID_OFFSET == 0x14U);
-  static_assert(Codec::SENTRY_INFO_ID_OFFSET == 0x1CU);
+  static_assert(Codec::SENTRY_INFO_ID_OFFSET == 0x21U);
   static_assert(Codec::LINK_STATUS_ID_OFFSET == 0x1DU);
   ReassemblesOnlyAfterAllFragments();
   RejectsMixedSequences();
@@ -142,4 +174,5 @@ int main() {
   LinkStatusCannotValidateMissingLocalGroups();
   ReassemblesFortyBytePositionPayload();
   ReassemblesSentryInfoAndExpiresItIndependently();
+  EncodesBasicStanceWithoutOverwritingNeighboringCommandFields();
 }

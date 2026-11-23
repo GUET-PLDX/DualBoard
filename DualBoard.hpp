@@ -429,7 +429,7 @@ class RefereeCanCodec {
   static constexpr uint32_t ROBOT_DAMAGE_ID_OFFSET = 0x13U;
   // Position payload uses six dedicated classic-CAN frames (40 bytes).
   static constexpr uint32_t ROBOT_POS_ID_OFFSET = 0x14U;
-  static constexpr uint32_t SENTRY_INFO_ID_OFFSET = 0x1CU;
+  static constexpr uint32_t SENTRY_INFO_ID_OFFSET = 0x21U;
   static constexpr uint32_t LINK_STATUS_ID_OFFSET = 0x1DU;
   static constexpr uint32_t REASSEMBLY_TIMEOUT_MS = 20U;
   static constexpr size_t FRAGMENT_DATA_SIZE = 7U;
@@ -917,13 +917,19 @@ class DualBoard {
       RefereeCanCodec::ROBOT_POS_ID_OFFSET;
   static constexpr uint32_t REFEREE_SENTRY_INFO_ID_OFFSET =
       RefereeCanCodec::SENTRY_INFO_ID_OFFSET;
+  static constexpr uint32_t REFEREE_SENTRY_INFO_FRAGMENT_COUNT =
+      (sizeof(Referee::SentryInfo) + RefereeCanCodec::FRAGMENT_DATA_SIZE - 1U) /
+      RefereeCanCodec::FRAGMENT_DATA_SIZE;
   static constexpr uint32_t REFEREE_LINK_STATUS_ID_OFFSET =
       RefereeCanCodec::LINK_STATUS_ID_OFFSET;
   static constexpr uint32_t REFEREE_STATUS_PERIOD_MS = 1000U;
   static constexpr uint32_t DECISION_DROP_LOG_PERIOD_MS = 1000U;
   static constexpr size_t DECISION_UPDATE_QUEUE_CAPACITY = 32U;
-  /* gimbal→chassis 帧 ID 偏移上界（不含）；当前最大为 DECISION_ID_OFFSET */
-  static constexpr uint32_t RX_ID_RANGE = DECISION_ID_OFFSET + 1U;
+  static constexpr uint32_t RX_ID_RANGE =
+      ROLE == DualBoardRole::GIMBAL
+          ? REFEREE_SENTRY_INFO_ID_OFFSET + REFEREE_SENTRY_INFO_FRAGMENT_COUNT -
+                1U
+          : DECISION_ID_OFFSET + 1U;
   static constexpr float ANGLE_SCALE = 10000.0f;
   static constexpr float ANGLE_LIMIT = 3.2f;
   static constexpr float GYRO_SCALE = 900.0f;
@@ -970,10 +976,9 @@ class DualBoard {
                 "RefereeLinkStatusFrame must be one classic CAN frame");
   static_assert(CAPACITOR_ID_OFFSET + 1U == CHASSIS_YAW_ID_OFFSET,
                 "chassis yaw CAN ID must follow capacitor");
-  static_assert(sizeof(Referee::SentryInfo) <= RefereeCanCodec::FRAGMENT_DATA_SIZE);
-  static_assert(CHASSIS_FF_ID_OFFSET + 1U < REFEREE_SENTRY_INFO_ID_OFFSET &&
-                REFEREE_SENTRY_INFO_ID_OFFSET < REFEREE_LINK_STATUS_ID_OFFSET &&
-                REFEREE_LINK_STATUS_ID_OFFSET < CAPACITOR_ID_OFFSET);
+  static_assert(REFEREE_LINK_STATUS_ID_OFFSET < CAPACITOR_ID_OFFSET &&
+                CHASSIS_YAW_ID_OFFSET < REFEREE_SENTRY_INFO_ID_OFFSET &&
+                DECISION_ID_OFFSET + 1U < REFEREE_SENTRY_INFO_ID_OFFSET);
   static_assert(CHASSIS_VELOCITY_ID_OFFSET >=
                         RefereeCanCodec::ROBOT_POS_ID_OFFSET + 6U &&
                     CHASSIS_VELOCITY_ID_OFFSET < REFEREE_SENTRY_INFO_ID_OFFSET &&
@@ -2174,7 +2179,8 @@ class DualBoard {
       HANDLE_REFEREE_GROUP(
           REFEREE_RFID_ID_OFFSET, 1U, state_.referee_assemblies_[9], rfid,
           Referee::SOURCE_RFID, Referee::CommandID::REF_CMD_ID_RFID)
-      HANDLE_REFEREE_GROUP(REFEREE_SENTRY_INFO_ID_OFFSET, 1U,
+      HANDLE_REFEREE_GROUP(REFEREE_SENTRY_INFO_ID_OFFSET,
+                           REFEREE_SENTRY_INFO_FRAGMENT_COUNT,
                            state_.referee_assemblies_[10], sentry_info,
                            Referee::SOURCE_SENTRY_INFO,
                            Referee::CommandID::REF_CMD_ID_SENTRY_DECISION)
