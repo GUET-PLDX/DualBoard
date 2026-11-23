@@ -6,6 +6,7 @@ module_description: 双板定频 CAN 业务帧模块，通过 LibXR Topic 保持
 depends:
 - id: GUET-PLDX/CMD
 - id: GUET-PLDX/Chassis
+  ref: 5032bc2e1fe16a0e5e6f4c0a6df25ec9f723ab47
 - id: GUET-PLDX/PowerControl
 - id: GUET-PLDX/Referee
 === END MANIFEST === */
@@ -57,6 +58,7 @@ enum class Mode : uint8_t {
   NAVIGATION = 4U,
   ROTOR_VARIABLE = 5U,
   NAVIGATION_ROTOR = 6U,
+  HOLE = 7U,
 };
 
 struct PlanarVelocity {
@@ -87,7 +89,12 @@ inline bool IsSupportedMode(Mode mode) {
   /* 上界比较依赖"新模式追加尾部"纪律；追加枚举时须同步此处与 static_assert 组
    */
   return static_cast<uint8_t>(mode) <=
-         static_cast<uint8_t>(Mode::NAVIGATION_ROTOR);
+         static_cast<uint8_t>(Mode::HOLE);
+}
+
+inline bool UsesChassisVelocity(Mode mode) {
+  return mode == Mode::NAVIGATION || mode == Mode::NAVIGATION_ROTOR ||
+         mode == Mode::HOLE;
 }
 
 inline Mode SelectOutputMode(Mode rc_mode, bool nav_valid, Mode nav_mode,
@@ -148,8 +155,7 @@ inline bool Encode(const Command& command, Frame& frame) {
     return false;
   }
 
-  const float SCALE = (command.mode == Mode::NAVIGATION ||
-                       command.mode == Mode::NAVIGATION_ROTOR)
+  const float SCALE = UsesChassisVelocity(command.mode)
                           ? CHASSIS_VELOCITY_SCALE
                           : NORMALIZED_SCALE;
   const float LIMIT = 32767.0F / SCALE;
@@ -192,7 +198,7 @@ inline bool Decode(const Frame& frame, Command& command) {
   command.self_define = SELF_DEFINE;
   command.mode = MODE;
   const float SCALE =
-      (MODE == Mode::NAVIGATION || MODE == Mode::NAVIGATION_ROTOR)
+      UsesChassisVelocity(MODE)
           ? CHASSIS_VELOCITY_SCALE
           : NORMALIZED_SCALE;
   command.vx = static_cast<float>(RAW[0]) / SCALE;
@@ -958,7 +964,9 @@ class DualBoard {
               static_cast<uint8_t>(Pldx::DualBoardControl::Mode::NAVIGATION) &&
           static_cast<uint8_t>(ChassisMode::NAVIGATION_ROTOR) ==
               static_cast<uint8_t>(
-                  Pldx::DualBoardControl::Mode::NAVIGATION_ROTOR),
+                  Pldx::DualBoardControl::Mode::NAVIGATION_ROTOR) &&
+          static_cast<uint8_t>(ChassisMode::HOLE) ==
+              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::HOLE),
       "DualBoard and chassis modes must use the same wire values");
   static_assert(sizeof(AngleFrame) == 8,
                 "AngleFrame must be one classic CAN frame");
@@ -2582,7 +2590,8 @@ class DualBoard {
            mode == static_cast<uint32_t>(ChassisMode::ROTOR) ||
            mode == static_cast<uint32_t>(ChassisMode::FOLLOW) ||
            mode == static_cast<uint32_t>(ChassisMode::NAVIGATION) ||
-           mode == static_cast<uint32_t>(ChassisMode::NAVIGATION_ROTOR);
+           mode == static_cast<uint32_t>(ChassisMode::NAVIGATION_ROTOR) ||
+           mode == static_cast<uint32_t>(ChassisMode::HOLE);
   }
 
   bool online_ = false;
