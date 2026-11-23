@@ -41,10 +41,11 @@
 超过 100 ms 未收到该帧时发布一次无效反馈。底盘采样超过 10 ms 未更新时帧内有效位清零。
 测试：`tests/chassis_velocity_frame_test.cpp`（编解码、序号扩展、主机镜像布局）。
 
-云台侧 decision 帧使用 `tx_id + 0x1f`（默认落在 `0x331`）。帧为 `SentryDecisionFrame`：版本、序列号、
+云台侧 decision 帧使用 `tx_id + 0x1f`（默认落在 `0x331`），避开底盘已有的
+`0x327` 裁判帧。帧为 `SentryDecisionFrame`：版本、序列号、
 有效位、状态、购弹增量、远程购弹次数和复活标志均固定在一个 Classic CAN 帧内。
 
-裁判系统固定帧使用底盘发送基址 `0x311`：
+裁判系统使用 2027 布局 v2，底盘发送基址为 `0x311`：
 
 | CAN ID | 内容 |
 |---|---|

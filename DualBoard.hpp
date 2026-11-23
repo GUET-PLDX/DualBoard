@@ -22,6 +22,7 @@ depends:
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <numbers>
 #include <type_traits>
 
 #include "CMD.hpp"
@@ -61,6 +62,7 @@ enum class Mode : uint8_t {
   NAVIGATION = 4U,
   ROTOR_VARIABLE = 5U,
   NAVIGATION_ROTOR = 6U,
+  HOLE = 7U,
 };
 
 struct PlanarVelocity {
@@ -90,19 +92,38 @@ static_assert(sizeof(UseCapacitorCommand) == 8U);
 inline bool IsSupportedMode(Mode mode) {
   /* 上界比较依赖"新模式追加尾部"纪律；追加枚举时须同步此处与 static_assert 组
    */
-  return static_cast<uint8_t>(mode) <=
-         static_cast<uint8_t>(Mode::NAVIGATION_ROTOR);
+  return static_cast<uint8_t>(mode) <= static_cast<uint8_t>(Mode::HOLE);
+}
+
+inline bool UsesChassisVelocity(Mode mode) {
+  return mode == Mode::NAVIGATION || mode == Mode::NAVIGATION_ROTOR ||
+         mode == Mode::HOLE;
 }
 
 inline Mode SelectOutputMode(Mode rc_mode, bool nav_valid, Mode nav_mode,
-                             bool auto_ctrl, bool rc_lost) {
+                             bool auto_ctrl, bool ai_chassis_online,
+                             bool rc_lost) {
   if (rc_lost) {
     return Mode::RELAX;
   }
-  if (auto_ctrl && nav_valid) {
-    return nav_mode;
+  if (auto_ctrl && ai_chassis_online && nav_valid) {
+    return nav_mode == Mode::HOLE ? Mode::RELAX : nav_mode;
+  }
+  if (auto_ctrl && rc_mode == Mode::HOLE) {
+    return Mode::RELAX;
   }
   return rc_mode;
+}
+
+inline void MapManualHoleVelocity(CMD::ChassisCMD& command,
+                                  float max_speed_mps) {
+  constexpr float COS_45 = std::numbers::sqrt2_v<float> / 2.0F;
+  const float SCALE = max_speed_mps * COS_45;
+  const float RIGHT = command.vx;
+  const float FORWARD = command.vy;
+  command.vx = SCALE * (RIGHT + FORWARD);
+  command.vy = SCALE * (FORWARD - RIGHT);
+  command.wz = 0.0F;
 }
 
 inline bool IsSupportedSelfDefine(int8_t value) {
@@ -152,10 +173,8 @@ inline bool Encode(const Command& command, Frame& frame) {
     return false;
   }
 
-  const float SCALE = (command.mode == Mode::NAVIGATION ||
-                       command.mode == Mode::NAVIGATION_ROTOR)
-                          ? CHASSIS_VELOCITY_SCALE
-                          : NORMALIZED_SCALE;
+  const float SCALE = UsesChassisVelocity(command.mode) ? CHASSIS_VELOCITY_SCALE
+                                                        : NORMALIZED_SCALE;
   const float LIMIT = 32767.0F / SCALE;
   std::array<int16_t, 3U> encoded{};
   const std::array<float, 3U> VALUES{command.vx, command.vy, command.wz};
@@ -196,9 +215,7 @@ inline bool Decode(const Frame& frame, Command& command) {
   command.self_define = SELF_DEFINE;
   command.mode = MODE;
   const float SCALE =
-      (MODE == Mode::NAVIGATION || MODE == Mode::NAVIGATION_ROTOR)
-          ? CHASSIS_VELOCITY_SCALE
-          : NORMALIZED_SCALE;
+      UsesChassisVelocity(MODE) ? CHASSIS_VELOCITY_SCALE : NORMALIZED_SCALE;
   command.vx = static_cast<float>(RAW[0]) / SCALE;
   command.vy = static_cast<float>(RAW[1]) / SCALE;
   command.wz = static_cast<float>(RAW[2]) / SCALE;
@@ -407,9 +424,9 @@ struct __attribute__((packed)) ChassisFeedback {
   float vy_mps;
   float wz_rad_s;     /* 轮速正解算的偏航角速度 */
   float gyro_z_rad_s; /* 底盘 IMU 陀螺 z（最近一次 MotionFrame） */
-  uint32_t sequence;  /* 由 CAN 8 位序号扩展；跳号表示 CAN/USB 丢包 */
-  uint32_t stamp_us;  /* 云台板收到 CAN 帧时的 µs 时钟低 32 位 */
-  uint8_t mode;       /* 底盘实际模式（DualBoardControl::Mode 线值） */
+  uint32_t sequence; /* 由 CAN 8 位序号扩展；跳号表示 CAN/USB 丢包 */
+  uint32_t stamp_us; /* 云台板收到 CAN 帧时的 µs 时钟低 32 位 */
+  uint8_t mode;      /* 底盘实际模式（DualBoardControl::Mode 线值） */
   // bit0 valid; bit1..4 wheel0..3; bit5 link; bit6 gyro valid.
   uint8_t flags;
 };
@@ -848,7 +865,8 @@ class DualBoard {
       const char* sentry_buy_resurrection_topic_name =
           "sentry_buy_resurrection",
       const char* sentry_state_topic_name = "sentry_state",
-      const char* chassis_euler_topic_name = "chassis_euler")
+      const char* chassis_euler_topic_name = "chassis_euler",
+      float manual_hole_max_speed_mps = 0.0F)
       : can_(&can),
         tx_id_(tx_id),
         rx_id_(rx_id),
@@ -864,6 +882,7 @@ class DualBoard {
         sentry_buy_resurrection_topic_name_(sentry_buy_resurrection_topic_name),
         sentry_state_topic_name_(sentry_state_topic_name),
         chassis_euler_topic_name_(chassis_euler_topic_name),
+        manual_hole_max_speed_mps_(manual_hole_max_speed_mps),
         power_control_(power_control),
         rx_frames_(rx_buffer_size) {
     ASSERT(rx_buffer_size > 0U);
@@ -1042,7 +1061,9 @@ class DualBoard {
               static_cast<uint8_t>(Pldx::DualBoardControl::Mode::NAVIGATION) &&
           static_cast<uint8_t>(ChassisMode::NAVIGATION_ROTOR) ==
               static_cast<uint8_t>(
-                  Pldx::DualBoardControl::Mode::NAVIGATION_ROTOR),
+                  Pldx::DualBoardControl::Mode::NAVIGATION_ROTOR) &&
+          static_cast<uint8_t>(ChassisMode::HOLE) ==
+              static_cast<uint8_t>(Pldx::DualBoardControl::Mode::HOLE),
       "DualBoard and chassis modes must use the same wire values");
   static_assert(sizeof(AngleFrame) == 8,
                 "AngleFrame must be one classic CAN frame");
@@ -1266,6 +1287,8 @@ class DualBoard {
                                callback);
     dual_board_event_.Register(
         static_cast<uint32_t>(ChassisMode::NAVIGATION_ROTOR), callback);
+    dual_board_event_.Register(static_cast<uint32_t>(ChassisMode::HOLE),
+                               callback);
   }
 
   void RegisterCmdEvent() {
@@ -1363,8 +1386,12 @@ class DualBoard {
           static_cast<Pldx::DualBoardControl::Mode>(state_.rc_chassis_mode_),
           state_.nav_mode_valid_,
           static_cast<Pldx::DualBoardControl::Mode>(state_.nav_chassis_mode_),
-          control.mode == CMD::Mode::CMD_AUTO_CTRL && control.ai_chassis_online,
+          control.mode == CMD::Mode::CMD_AUTO_CTRL, control.ai_chassis_online,
           !control.rc_online);
+      if (state_.committed_mode_ == Pldx::DualBoardControl::Mode::HOLE) {
+        Pldx::DualBoardControl::MapManualHoleVelocity(
+            state_.local_chassis_command_, manual_hole_max_speed_mps_);
+      }
       state_.local_chassis_command_time_ms_ =
           static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
     } else {
@@ -2731,7 +2758,8 @@ class DualBoard {
            mode == static_cast<uint32_t>(ChassisMode::ROTOR) ||
            mode == static_cast<uint32_t>(ChassisMode::FOLLOW) ||
            mode == static_cast<uint32_t>(ChassisMode::NAVIGATION) ||
-           mode == static_cast<uint32_t>(ChassisMode::NAVIGATION_ROTOR);
+           mode == static_cast<uint32_t>(ChassisMode::NAVIGATION_ROTOR) ||
+           mode == static_cast<uint32_t>(ChassisMode::HOLE);
   }
 
   bool online_ = false;
@@ -2752,6 +2780,7 @@ class DualBoard {
   const char* sentry_buy_resurrection_topic_name_;
   const char* sentry_state_topic_name_;
   const char* chassis_euler_topic_name_;
+  const float manual_hole_max_speed_mps_;
   PowerControl* power_control_;
   LibXR::Topic mode_topic_;
   LibXR::Topic launcher_ref_topic_;

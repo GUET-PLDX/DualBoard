@@ -52,7 +52,7 @@ void RejectsInvalidWireValues() {
   assert(!Decode(frame, decoded));
 
   frame = {};
-  frame[7] = 0x07U;  // first unsupported mode
+  frame[7] = 0x08U;
   assert(!Decode(frame, decoded));
 
   frame = {};
@@ -67,17 +67,19 @@ void RejectsInvalidWireValues() {
   frame = {};
   frame[0] = 0xC5U;
   frame[1] = 0x09U;
-  frame[7] = 0x87U;  // reserved high bit and unsupported mode
+  frame[7] = 0x87U;  // reserved high bit
   assert(!Decode(frame, decoded));
 }
 
 void MotionTargetsRoundTrip() {
   for (Mode mode :
        {Mode::RELAX, Mode::INDEPENDENT, Mode::ROTOR, Mode::FOLLOW,
-        Mode::NAVIGATION, Mode::ROTOR_VARIABLE, Mode::NAVIGATION_ROTOR}) {
+        Mode::NAVIGATION, Mode::ROTOR_VARIABLE, Mode::NAVIGATION_ROTOR,
+        Mode::HOLE}) {
     Command command{};
     command.mode = mode;
-    command.vx = (mode == Mode::NAVIGATION || mode == Mode::NAVIGATION_ROTOR)
+    command.vx = (mode == Mode::NAVIGATION || mode == Mode::NAVIGATION_ROTOR ||
+                  mode == Mode::HOLE)
                      ? 2.5F
                      : 0.25F;
     command.vy = -command.vx;
@@ -119,6 +121,8 @@ void NavigationVelocityGoldenVector() {
   ExpectFrame(command, {0xDC, 0x05, 0x3C, 0xF6, 0xFA, 0x00, 0x00, 0x04});
   command.mode = Mode::NAVIGATION_ROTOR;
   ExpectFrame(command, {0xDC, 0x05, 0x3C, 0xF6, 0xFA, 0x00, 0x00, 0x06});
+  command.mode = Mode::HOLE;
+  ExpectFrame(command, {0xDC, 0x05, 0x3C, 0xF6, 0xFA, 0x00, 0x00, 0x07});
   Frame frame{};
   assert(Encode(command, frame));
   frame[7] |= 0x80U;  // Reserved high bits fail closed.
@@ -147,16 +151,48 @@ void UseCapacitorFrameRoundTrip() {
 
 void SelectsChassisOutputMode() {
   using Pldx::DualBoardControl::SelectOutputMode;
-  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, false, true) ==
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, false, true, true) ==
          Mode::RELAX);
-  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, false, false) ==
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, false, true, false) ==
          Mode::FOLLOW);
-  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, true, false) ==
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, true, true, false) ==
          Mode::ROTOR);
-  assert(SelectOutputMode(Mode::FOLLOW, false, Mode::ROTOR, true, false) ==
+  assert(SelectOutputMode(Mode::FOLLOW, false, Mode::ROTOR, true, true, false) ==
          Mode::FOLLOW);
-  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, false, false) ==
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, true, false, false) ==
          Mode::FOLLOW);
+
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::HOLE, true, true, false) ==
+         Mode::RELAX);
+  assert(SelectOutputMode(Mode::HOLE, true, Mode::NAVIGATION, false, true, false) ==
+         Mode::HOLE);
+  assert(SelectOutputMode(Mode::HOLE, true, Mode::NAVIGATION, false, true, true) ==
+         Mode::RELAX);
+  assert(SelectOutputMode(Mode::HOLE, true, Mode::NAVIGATION, true, true, false) ==
+         Mode::NAVIGATION);
+  assert(SelectOutputMode(Mode::HOLE, true, Mode::NAVIGATION, true, false, false) ==
+         Mode::RELAX);
+}
+
+void MapsManualHoleVelocityInFoldedFrontFrame() {
+  using Pldx::DualBoardControl::MapManualHoleVelocity;
+  constexpr float FULL_SPEED_MPS = 3.9F;
+  const float COMPONENT_MPS = FULL_SPEED_MPS / std::sqrt(2.0F);
+  for (float direction : {-1.0F, 1.0F}) {
+    CMD::ChassisCMD forward{};
+    forward.vy = direction;
+    forward.wz = 1.0F;
+    MapManualHoleVelocity(forward, FULL_SPEED_MPS);
+    assert(std::abs(forward.vx - direction * COMPONENT_MPS) < 0.001F);
+    assert(std::abs(forward.vy - direction * COMPONENT_MPS) < 0.001F);
+    assert(forward.wz == 0.0F);
+
+    CMD::ChassisCMD strafe{};
+    strafe.vx = direction;
+    MapManualHoleVelocity(strafe, FULL_SPEED_MPS);
+    assert(std::abs(strafe.vx - direction * COMPONENT_MPS) < 0.001F);
+    assert(std::abs(strafe.vy + direction * COMPONENT_MPS) < 0.001F);
+  }
 }
 
 }  // namespace
@@ -169,6 +205,7 @@ int main() {
   NavigationVelocityGoldenVector();
   UseCapacitorFrameRoundTrip();
   SelectsChassisOutputMode();
+  MapsManualHoleVelocityInFoldedFrontFrame();
   static_assert(Pldx::DualBoardControl::RESERVED_MASK == 0xF0U);
   static_assert(Pldx::DualBoardControl::USE_CAPACITOR_ID_OFFSET == 0x11U);
 }
