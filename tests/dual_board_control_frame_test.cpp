@@ -195,6 +195,175 @@ void MapsManualHoleVelocityInFoldedFrontFrame() {
   }
 }
 
+void DrivesManualConfigurationInMeasuredOrder() {
+  using Pldx::FoldAction;
+  using Pldx::LifterPosition;
+  using Pldx::DualBoardControl::ConfigurationControl;
+  using Pldx::DualBoardControl::ConfigurationInput;
+  ConfigurationControl controller;
+  ConfigurationInput input{.request = Mode::HOLE,
+                           .actual_mode = Mode::ROTOR,
+                           .position = LifterPosition::TOP,
+                           .feedback_valid = true};
+  const auto expect = [&](uint32_t time_ms, Mode mode, FoldAction fold) {
+    input.yaw_sample_us = 1U + time_ms * 1000U;
+    const auto output = controller.Step(input);
+    assert(output.mode == mode);
+    assert(output.fold == fold);
+    CMD::ChassisCMD stick{};
+    stick.vx = 0.2F;
+    stick.vy = 0.6F;
+    const auto wire =
+        Pldx::DualBoardControl::MakeControlCommand(stick, output.mode, 3.9F);
+    Frame frame{};
+    Command decoded{};
+    assert(Encode(wire, frame) && Decode(frame, decoded));
+    assert(decoded.mode == mode);
+    const float expected_vx = mode == Mode::HOLE ? 2.206F : 0.2F;
+    const float expected_vy = mode == Mode::HOLE ? 1.103F : 0.6F;
+    assert(std::abs(decoded.vx - expected_vx) < 0.001F);
+    assert(std::abs(decoded.vy - expected_vy) < 0.001F);
+    return output.folded;
+  };
+
+  expect(0, Mode::HOLE, FoldAction::HOLD);
+  input.yaw_rad = 0.78539816F;
+  expect(10, Mode::HOLE, FoldAction::HOLD);
+  input.actual_mode = Mode::HOLE;
+  expect(20, Mode::HOLE, FoldAction::HOLD);
+  expect(69, Mode::HOLE, FoldAction::HOLD);
+  assert(!expect(70, Mode::HOLE, FoldAction::BOTTOM));
+  input.position = LifterPosition::BOTTOM;
+  assert(expect(80, Mode::HOLE, FoldAction::BOTTOM));
+
+  input.request = Mode::ROTOR;
+  expect(90, Mode::HOLE, FoldAction::TOP);
+  input.position = LifterPosition::TOP;
+  expect(100, Mode::FOLLOW, FoldAction::TOP);
+  input.yaw_rad = 0.0F;
+  expect(110, Mode::FOLLOW, FoldAction::TOP);
+  input.actual_mode = Mode::FOLLOW;
+  expect(120, Mode::FOLLOW, FoldAction::TOP);
+  expect(170, Mode::ROTOR, FoldAction::TOP);
+  input.actual_mode = Mode::ROTOR;
+  input.yaw_rad = 1.2F;
+  expect(180, Mode::ROTOR, FoldAction::TOP);
+}
+
+void FollowsLatestRequestDuringConfigurationChange() {
+  using Pldx::FoldAction;
+  using Pldx::LifterPosition;
+  using Pldx::DualBoardControl::ConfigurationControl;
+  using Pldx::DualBoardControl::ConfigurationInput;
+  ConfigurationControl controller;
+  ConfigurationInput input{.request = Mode::HOLE,
+                           .actual_mode = Mode::FOLLOW,
+                           .position = LifterPosition::TOP,
+                           .feedback_valid = true};
+  const auto expect = [&](uint32_t time_ms, Mode mode, FoldAction fold) {
+    input.yaw_sample_us = 1U + time_ms * 1000U;
+    const auto output = controller.Step(input);
+    assert(output.mode == mode && output.fold == fold);
+  };
+
+  expect(0, Mode::HOLE, FoldAction::HOLD);
+  input.request = Mode::ROTOR;
+  expect(10, Mode::FOLLOW, FoldAction::TOP);
+  input.request = Mode::HOLE;
+  input.actual_mode = Mode::HOLE;
+  input.yaw_rad = 0.78539816F;
+  expect(20, Mode::HOLE, FoldAction::HOLD);
+  expect(70, Mode::HOLE, FoldAction::BOTTOM);
+  input.position = LifterPosition::MIDDLE;
+  input.request = Mode::ROTOR;
+  expect(80, Mode::HOLE, FoldAction::TOP);
+  input.yaw_rad = 0.70F;
+  expect(90, Mode::HOLE, FoldAction::HOLD);
+  input.request = Mode::HOLE;
+  input.yaw_rad = 0.78539816F;
+  expect(100, Mode::HOLE, FoldAction::HOLD);
+  expect(150, Mode::HOLE, FoldAction::BOTTOM);
+
+  input.request = Mode::ROTOR;
+  expect(160, Mode::HOLE, FoldAction::TOP);
+  input.position = LifterPosition::TOP;
+  expect(170, Mode::FOLLOW, FoldAction::TOP);
+  input.actual_mode = Mode::FOLLOW;
+  input.yaw_rad = 0.3F;
+  input.request = Mode::HOLE;
+  expect(180, Mode::HOLE, FoldAction::HOLD);
+  input.yaw_rad = 0.78539816F;
+  expect(240, Mode::HOLE, FoldAction::HOLD);
+  input.actual_mode = Mode::HOLE;
+  expect(250, Mode::HOLE, FoldAction::HOLD);
+  expect(300, Mode::HOLE, FoldAction::BOTTOM);
+}
+
+void StopsAndRestartsFromMeasuredConfiguration() {
+  using Pldx::FoldAction;
+  using Pldx::LifterPosition;
+  using Pldx::DualBoardControl::ConfigurationControl;
+  using Pldx::DualBoardControl::ConfigurationInput;
+  ConfigurationControl controller;
+  ConfigurationInput input{.request = Mode::ROTOR};
+  const auto expect = [&](uint32_t time_ms, Mode mode, FoldAction fold) {
+    input.yaw_sample_us = 1U + time_ms * 1000U;
+    const auto output = controller.Step(input);
+    assert(output.mode == mode && output.fold == fold);
+  };
+
+  expect(0, Mode::RELAX, FoldAction::HOLD);
+  input.feedback_valid = true;
+  input.position = LifterPosition::BOTTOM;
+  expect(10, Mode::HOLE, FoldAction::HOLD);
+  input.actual_mode = Mode::HOLE;
+  input.yaw_rad = 0.78539816F;
+  expect(20, Mode::HOLE, FoldAction::HOLD);
+  expect(70, Mode::HOLE, FoldAction::TOP);
+  input.request = Mode::RELAX;
+  expect(71, Mode::RELAX, FoldAction::HOLD);
+  input.request = Mode::HOLE;
+  input.position = LifterPosition::MIDDLE;
+  expect(80, Mode::HOLE, FoldAction::HOLD);
+  input.feedback_valid = false;
+  expect(100, Mode::RELAX, FoldAction::HOLD);
+  input.feedback_valid = true;
+  expect(140, Mode::HOLE, FoldAction::HOLD);
+  expect(190, Mode::HOLE, FoldAction::BOTTOM);
+
+  input.request = Mode::ROTOR;
+  input.position = LifterPosition::TOP;
+  input.actual_mode = Mode::FOLLOW;
+  input.yaw_rad = 0.0F;
+  expect(200, Mode::FOLLOW, FoldAction::TOP);
+  expect(250, Mode::ROTOR, FoldAction::TOP);
+  input.yaw_rad = std::numeric_limits<float>::quiet_NaN();
+  expect(260, Mode::RELAX, FoldAction::HOLD);
+  input.yaw_rad = 0.0F;
+  expect(270, Mode::FOLLOW, FoldAction::TOP);
+  expect(320, Mode::ROTOR, FoldAction::TOP);
+}
+
+void RepeatedYawSampleDoesNotCountAsSettled() {
+  using Pldx::FoldAction;
+  using Pldx::LifterPosition;
+  using Pldx::DualBoardControl::ConfigurationControl;
+  using Pldx::DualBoardControl::ConfigurationInput;
+  ConfigurationControl controller;
+  ConfigurationInput input{.request = Mode::HOLE,
+                           .actual_mode = Mode::HOLE,
+                           .position = LifterPosition::TOP,
+                           .yaw_rad = 0.78539816F,
+                           .feedback_valid = true,
+                           .yaw_sample_us = 1000U};
+  assert(controller.Step(input).fold == FoldAction::HOLD);
+  assert(controller.Step(input).fold == FoldAction::HOLD);
+  input.yaw_sample_us = 101000U;
+  assert(controller.Step(input).fold == FoldAction::HOLD);
+  input.yaw_sample_us = 151000U;
+  assert(controller.Step(input).fold == FoldAction::BOTTOM);
+}
+
 }  // namespace
 
 int main() {
@@ -206,6 +375,10 @@ int main() {
   UseCapacitorFrameRoundTrip();
   SelectsChassisOutputMode();
   MapsManualHoleVelocityInFoldedFrontFrame();
+  DrivesManualConfigurationInMeasuredOrder();
+  FollowsLatestRequestDuringConfigurationChange();
+  StopsAndRestartsFromMeasuredConfiguration();
+  RepeatedYawSampleDoesNotCountAsSettled();
   static_assert(Pldx::DualBoardControl::RESERVED_MASK == 0xF0U);
   static_assert(Pldx::DualBoardControl::USE_CAPACITOR_ID_OFFSET == 0x11U);
 }

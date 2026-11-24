@@ -5,8 +5,9 @@
 module_description: 双板定频 CAN 业务帧模块，通过 LibXR Topic 保持上层接口并使用 Classic CAN 固定帧同步双板状态
 depends:
 - id: GUET-PLDX/CMD
+  ref: e496fc2fadb49d90bd2924432c46d140efdba3a0
 - id: GUET-PLDX/Chassis
-  ref: 96ef1dd22f47eb8337fc3056e6979d63891ef977
+  ref: 1225795a0b621c9293f8817a7a0cc2795c74ffa9
 - id: GUET-PLDX/PowerControl
   ref: 5d06d27928970a736283d3f6273383534517c4f9
 - id: GUET-PLDX/Referee
@@ -115,6 +116,76 @@ inline Mode SelectOutputMode(Mode rc_mode, bool nav_valid, Mode nav_mode,
   return rc_mode;
 }
 
+struct ConfigurationInput {
+  Mode request = Mode::RELAX;
+  Mode actual_mode = Mode::RELAX;
+  LifterPosition position = LifterPosition::MIDDLE;
+  float yaw_rad = 0.0F;
+  bool feedback_valid = false;
+  uint64_t yaw_sample_us = 0U;
+};
+
+struct ConfigurationOutput {
+  Mode mode = Mode::RELAX;
+  FoldAction fold = FoldAction::HOLD;
+  bool folded = false;
+};
+
+class ConfigurationControl {
+ public:
+  ConfigurationOutput Step(const ConfigurationInput& input) {
+    if (!input.feedback_valid || !std::isfinite(input.yaw_rad) ||
+        input.yaw_sample_us == 0U ||
+        (input.request != Mode::HOLE && input.request != Mode::ROTOR)) {
+      Reset();
+      return {};
+    }
+
+    if (input.request == Mode::HOLE || input.position != LifterPosition::TOP) {
+      rotor_allowed_ = false;
+      const bool aligned = IsSettled(input, Mode::HOLE, HOLE_ANGLE_RAD);
+      if (input.request == Mode::HOLE) {
+        return {Mode::HOLE, aligned ? FoldAction::BOTTOM : FoldAction::HOLD,
+                aligned && input.position == LifterPosition::BOTTOM};
+      }
+      return {Mode::HOLE, aligned ? FoldAction::TOP : FoldAction::HOLD};
+    }
+
+    if (!rotor_allowed_) {
+      rotor_allowed_ = IsSettled(input, Mode::FOLLOW, 0.0F);
+    }
+    return {rotor_allowed_ ? Mode::ROTOR : Mode::FOLLOW, FoldAction::TOP};
+  }
+
+  void Reset() { *this = {}; }
+
+ private:
+  static constexpr float HOLE_ANGLE_RAD = std::numbers::pi_v<float> / 4.0F;
+  static constexpr float ALIGNMENT_TOLERANCE_RAD = 0.05F;
+  static constexpr uint64_t ALIGNMENT_SETTLE_US = 50'000U;
+
+  bool IsSettled(const ConfigurationInput& input, Mode mode, float target_rad) {
+    const float error = std::remainder(input.yaw_rad - target_rad,
+                                       2.0F * std::numbers::pi_v<float>);
+    if (input.actual_mode != mode || std::abs(error) > ALIGNMENT_TOLERANCE_RAD) {
+      alignment_mode_ = Mode::RELAX;
+      return false;
+    }
+    if (alignment_mode_ != mode || input.yaw_sample_us < last_yaw_sample_us_ ||
+        input.yaw_sample_us - last_yaw_sample_us_ > ALIGNMENT_SETTLE_US) {
+      alignment_mode_ = mode;
+      alignment_since_us_ = input.yaw_sample_us;
+    }
+    last_yaw_sample_us_ = input.yaw_sample_us;
+    return input.yaw_sample_us - alignment_since_us_ >= ALIGNMENT_SETTLE_US;
+  }
+
+  Mode alignment_mode_ = Mode::RELAX;
+  uint64_t alignment_since_us_ = 0U;
+  uint64_t last_yaw_sample_us_ = 0U;
+  bool rotor_allowed_ = false;
+};
+
 inline void MapManualHoleVelocity(CMD::ChassisCMD& command,
                                   float max_speed_mps) {
   constexpr float COS_45 = std::numbers::sqrt2_v<float> / 2.0F;
@@ -124,6 +195,15 @@ inline void MapManualHoleVelocity(CMD::ChassisCMD& command,
   command.vx = SCALE * (RIGHT + FORWARD);
   command.vy = SCALE * (FORWARD - RIGHT);
   command.wz = 0.0F;
+}
+
+inline Command MakeControlCommand(CMD::ChassisCMD command, Mode mode,
+                                  float manual_hole_max_speed_mps) {
+  if (mode == Mode::HOLE) {
+    MapManualHoleVelocity(command, manual_hole_max_speed_mps);
+  }
+  return {command.vx, command.vy, command.wz,
+          static_cast<int8_t>(command.self_define), mode};
 }
 
 inline bool IsSupportedSelfDefine(int8_t value) {
@@ -866,7 +946,8 @@ class DualBoard {
           "sentry_buy_resurrection",
       const char* sentry_state_topic_name = "sentry_state",
       const char* chassis_euler_topic_name = "chassis_euler",
-      float manual_hole_max_speed_mps = 0.0F)
+      float manual_hole_max_speed_mps = 0.0F,
+      bool manual_configuration_interlock = false)
       : can_(&can),
         tx_id_(tx_id),
         rx_id_(rx_id),
@@ -883,6 +964,7 @@ class DualBoard {
         sentry_state_topic_name_(sentry_state_topic_name),
         chassis_euler_topic_name_(chassis_euler_topic_name),
         manual_hole_max_speed_mps_(manual_hole_max_speed_mps),
+        manual_configuration_interlock_(manual_configuration_interlock),
         power_control_(power_control),
         rx_frames_(rx_buffer_size) {
     ASSERT(rx_buffer_size > 0U);
@@ -1152,6 +1234,16 @@ class DualBoard {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       RegisterTopicCallback<CMD::ChassisControl, &DualBoard::OnLocalControl>(
           "control_state");
+      if (manual_configuration_interlock_) {
+        state_.configuration_fold_topic_ = LibXR::Topic(
+            LibXR::Topic::FindOrCreate<Pldx::ConfigurationFoldCommand>(
+                Pldx::CONFIGURATION_FOLD_COMMAND_TOPIC));
+        state_.configuration_folded_topic_ =
+            CreateTopic<bool>("configuration_folded");
+        RegisterTopicCallback<Pldx::ConfigurationFeedback,
+                              &DualBoard::OnConfigurationFeedback>(
+            Pldx::CONFIGURATION_FEEDBACK_TOPIC);
+      }
       RegisterTopicCallback<float, &DualBoard::OnLocalYawAngle>(
           "yawmotor_angle");
       RegisterTopicCallback<float, &DualBoard::OnLocalPitchAngle>(
@@ -1380,6 +1472,10 @@ class DualBoard {
   void OnLocalControl(const CMD::ChassisControl& control) {
     if constexpr (ROLE == DualBoardRole::GIMBAL) {
       LibXR::Mutex::LockGuard lock(data_mutex_);
+      if (manual_configuration_interlock_ &&
+          state_.local_control_.control_revision != control.control_revision) {
+        state_.configuration_control_.Reset();
+      }
       state_.local_chassis_command_ = control.command;
       state_.local_control_ = control;
       state_.committed_mode_ = Pldx::DualBoardControl::SelectOutputMode(
@@ -1388,14 +1484,21 @@ class DualBoard {
           static_cast<Pldx::DualBoardControl::Mode>(state_.nav_chassis_mode_),
           control.mode == CMD::Mode::CMD_AUTO_CTRL, control.ai_chassis_online,
           !control.rc_online);
-      if (state_.committed_mode_ == Pldx::DualBoardControl::Mode::HOLE) {
-        Pldx::DualBoardControl::MapManualHoleVelocity(
-            state_.local_chassis_command_, manual_hole_max_speed_mps_);
-      }
       state_.local_chassis_command_time_ms_ =
           static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
     } else {
       UNUSED(control);
+    }
+  }
+
+  void OnConfigurationFeedback(const Pldx::ConfigurationFeedback& feedback) {
+    if constexpr (ROLE == DualBoardRole::GIMBAL) {
+      LibXR::Mutex::LockGuard lock(data_mutex_);
+      state_.configuration_feedback_ = feedback;
+      state_.configuration_feedback_time_ms_ =
+          static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+    } else {
+      UNUSED(feedback);
     }
   }
 
@@ -1502,6 +1605,7 @@ class DualBoard {
       LibXR::Mutex::LockGuard lock(data_mutex_);
       state_.local_chassis_command_ = {};
       state_.output_relax_ = true;
+      state_.configuration_control_.Reset();
       PublishSelectedModeLocked(static_cast<uint8_t>(ChassisMode::RELAX));
     }
   }
@@ -1547,7 +1651,7 @@ class DualBoard {
           LibXR::Mutex::LockGuard lock(data_mutex_);
           if (state_.command_assembly_.Expire(now_ms) &&
               state_.command_assembly_.MotionFresh(now_ms)) {
-            state_.chassis_cmd_topic_.Publish(state_.command_assembly_.command);
+            PublishChassisCommandLocked(state_.remote_mode_);
           }
         }
         SendMotionFrameIfDue(now_ms);
@@ -1791,7 +1895,7 @@ class DualBoard {
       state_.command_assembly_.Feedforward(
           Pldx::DualBoardControl::DecodeChassisFeedforward(frame), NOW);
       if (state_.command_assembly_.MotionFresh(NOW)) {
-        state_.chassis_cmd_topic_.Publish(state_.command_assembly_.command);
+        PublishChassisCommandLocked(state_.remote_mode_);
       }
     } else {
       UNUSED(pack);
@@ -1833,6 +1937,9 @@ class DualBoard {
       bool use_capacitor = true;
       Pldx::DualBoardControl::Mode selected_mode =
           Pldx::DualBoardControl::Mode::RELAX;
+      Pldx::ConfigurationFoldCommand fold_command{
+          .action = Pldx::FoldAction::HOLD, .stamp_ms = now_ms};
+      bool configuration_folded = false;
 
       {
         LibXR::Mutex::LockGuard lock(data_mutex_);
@@ -1846,18 +1953,37 @@ class DualBoard {
                                  offline_timeout_ms_;
         selected_mode = RC_LOST ? Pldx::DualBoardControl::Mode::RELAX
                                 : state_.committed_mode_;
-        if (RC_LOST) {
+        const bool manual_configuration =
+            manual_configuration_interlock_ &&
+            state_.local_control_.mode == CMD::Mode::CMD_OP_CTRL;
+        if (manual_configuration_interlock_) {
+          fold_command.control_revision = state_.local_control_.control_revision;
+          if (!RC_LOST && manual_configuration) {
+            const auto output = SelectManualConfiguration(now_ms);
+            selected_mode = output.mode;
+            fold_command.action = output.fold;
+            configuration_folded = output.folded;
+            if (std::isfinite(yaw_angle)) {
+              yaw_angle = std::remainder(yaw_angle,
+                                         static_cast<float>(LibXR::TWO_PI));
+            }
+          } else {
+            state_.configuration_control_.Reset();
+          }
+        }
+        if (RC_LOST || (manual_configuration &&
+                        selected_mode == Pldx::DualBoardControl::Mode::RELAX)) {
           command = {};
         }
         PublishSelectedModeLocked(static_cast<uint8_t>(selected_mode));
       }
+      if (manual_configuration_interlock_) {
+        state_.configuration_fold_topic_.Publish(fold_command);
+        state_.configuration_folded_topic_.Publish(configuration_folded);
+      }
 
-      Pldx::DualBoardControl::Command wire_command{};
-      wire_command.vx = command.vx;
-      wire_command.vy = command.vy;
-      wire_command.wz = command.wz;
-      wire_command.self_define = static_cast<int8_t>(command.self_define);
-      wire_command.mode = selected_mode;
+      const auto wire_command = Pldx::DualBoardControl::MakeControlCommand(
+          command, selected_mode, manual_hole_max_speed_mps_);
       ControlFrame control_frame{};
       static_cast<void>(
           Pldx::DualBoardControl::Encode(wire_command, control_frame));
@@ -1876,6 +2002,29 @@ class DualBoard {
       SendClassicFrame(tx_id_ + ANGLE_ID_OFFSET, angle_frame);
       SendClassicFrame(tx_id_ + USE_CAPACITOR_ID_OFFSET, use_capacitor_frame);
     }
+  }
+
+  Pldx::DualBoardControl::ConfigurationOutput SelectManualConfiguration(
+      uint32_t now_ms) {
+    using Pldx::DualBoardControl::Mode;
+    const auto& feedback = state_.configuration_feedback_;
+    const bool valid = feedback.fold_valid && feedback.yaw_valid &&
+                       feedback.fold_sample_us != 0U &&
+                       feedback.yaw_sample_us != 0U &&
+                       now_ms - state_.configuration_feedback_time_ms_ <=
+                           offline_timeout_ms_ &&
+                       state_.has_chassis_velocity_sequence_ &&
+                       !state_.chassis_velocity_stale_ &&
+                       now_ms - state_.last_chassis_velocity_rx_ms_ <=
+                           CHASSIS_VELOCITY_TIMEOUT_MS &&
+                       !can_bus_fault_.IsSet();
+    return state_.configuration_control_.Step(
+        {.request = static_cast<Mode>(state_.rc_chassis_mode_),
+         .actual_mode = state_.actual_chassis_mode_,
+         .position = feedback.position,
+         .yaw_rad = feedback.yaw_rad,
+         .feedback_valid = valid,
+         .yaw_sample_us = feedback.yaw_sample_us});
   }
 
   void SendLauncherFeedbackFrameIfDue(uint32_t now_ms) {
@@ -2434,6 +2583,8 @@ class DualBoard {
         state_.has_chassis_velocity_sequence_ = true;
         state_.last_chassis_velocity_rx_ms_ = NOW_MS;
         state_.chassis_velocity_stale_ = !DECODED.valid;
+        state_.actual_chassis_mode_ =
+            static_cast<Pldx::DualBoardControl::Mode>(DECODED.mode);
 
         feedback.sequence = SEQUENCE;
         feedback.gyro_z_rad_s = state_.motion_state_.yaw_rate_rad_s;
@@ -2536,24 +2687,25 @@ class DualBoard {
       online_ = true;
       safe_state_published_ = false;
 
+      const uint8_t MODE = static_cast<uint8_t>(decoded.mode);
+      bool publish_mode = restored;
       {
         LibXR::Mutex::LockGuard lock(data_mutex_);
         state_.command_assembly_.Motion(
             decoded, static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds()));
-        state_.chassis_cmd_topic_.Publish(state_.command_assembly_.command);
+        publish_mode |= state_.remote_mode_ != MODE;
+        if constexpr (std::is_same_v<ChassisType, Omni>) {
+          publish_mode |= PublishChassisCommandLocked(MODE);
+          state_.remote_mode_ = MODE;
+        } else {
+          PublishChassisCommandLocked(MODE);
+          if (publish_mode) publish_mode = ForceRemoteMode(MODE);
+        }
       }
 
-      const uint8_t MODE = static_cast<uint8_t>(decoded.mode);
-      bool mode_mismatch = false;
-      if constexpr (std::is_same_v<ChassisType, Omni>) {
-        mode_mismatch = chassis_ == nullptr ||
-                        static_cast<uint32_t>(chassis_->GetMode()) != MODE;
-      }
-      if (restored || state_.remote_mode_ != MODE || mode_mismatch) {
+      if (publish_mode) {
         uint32_t mode = MODE;
-        if (ForceRemoteMode(mode)) {
-          mode_topic_.Publish(mode);
-        }
+        mode_topic_.Publish(mode);
       }
     } else {
       UNUSED(pack);
@@ -2716,20 +2868,36 @@ class DualBoard {
 
   void PublishSafeChassisState() {
     if constexpr (ROLE == DualBoardRole::CHASSIS) {
+      const auto relax = static_cast<uint8_t>(ChassisMode::RELAX);
       {
         LibXR::Mutex::LockGuard lock(data_mutex_);
         state_.command_assembly_ = {};
-        state_.chassis_cmd_topic_.Publish(state_.command_assembly_.command);
+        PublishChassisCommandLocked(relax);
+        if constexpr (std::is_same_v<ChassisType, Omni>) {
+          state_.remote_mode_ = relax;
+        } else {
+          ForceRemoteMode(relax);
+        }
       }
 
       float zero_angle = 0.0f;
       state_.yaw_angle_topic_.Publish(zero_angle);
       state_.pitch_angle_topic_.Publish(zero_angle);
 
-      uint32_t mode = static_cast<uint32_t>(ChassisMode::RELAX);
+      uint32_t mode = relax;
       mode_topic_.Publish(mode);
-      ForceRemoteMode(static_cast<uint32_t>(ChassisMode::RELAX));
     }
+  }
+
+  bool PublishChassisCommandLocked(uint8_t mode) {
+    auto command = state_.command_assembly_.command;
+    bool changed = false;
+    if constexpr (std::is_same_v<ChassisType, Omni>) {
+      changed = chassis_->ApplyControlCommand(static_cast<ChassisMode>(mode),
+                                              command);
+    }
+    state_.chassis_cmd_topic_.Publish(command);
+    return changed;
   }
 
   bool ForceRemoteMode(uint32_t mode) {
@@ -2738,11 +2906,6 @@ class DualBoard {
       state_.remote_mode_ = std::numeric_limits<uint8_t>::max();
       if (chassis_ != nullptr) {
         chassis_->GetEvent().Active(mode);
-        if constexpr (std::is_same_v<ChassisType, Omni>) {
-          if (static_cast<uint32_t>(chassis_->GetMode()) != mode) {
-            return false;
-          }
-        }
         state_.remote_mode_ = static_cast<uint8_t>(mode);
         return true;
       }
@@ -2781,6 +2944,7 @@ class DualBoard {
   const char* sentry_state_topic_name_;
   const char* chassis_euler_topic_name_;
   const float manual_hole_max_speed_mps_;
+  const bool manual_configuration_interlock_;
   PowerControl* power_control_;
   LibXR::Topic mode_topic_;
   LibXR::Topic launcher_ref_topic_;
@@ -2834,6 +2998,13 @@ class DualBoard {
     bool output_relax_ = false;
     bool output_mode_published_ = false;
     bool local_use_capacitor_ = true;
+    Pldx::DualBoardControl::Mode actual_chassis_mode_ =
+        Pldx::DualBoardControl::Mode::RELAX;
+    Pldx::ConfigurationFeedback configuration_feedback_{};
+    uint32_t configuration_feedback_time_ms_ = 0U;
+    Pldx::DualBoardControl::ConfigurationControl configuration_control_;
+    LibXR::Topic configuration_fold_topic_;
+    LibXR::Topic configuration_folded_topic_;
     Referee::RobotGameRefereePack gimbal_sentry_ref_{};
     Referee::LauncherPack launcher_feedback_{};
     RefereeAssembly referee_assemblies_[11]{};
