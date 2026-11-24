@@ -1240,10 +1240,14 @@ class DualBoard {
                 Pldx::CONFIGURATION_FOLD_COMMAND_TOPIC));
         state_.configuration_folded_topic_ =
             CreateTopic<bool>("configuration_folded");
+        LibXR::Topic::FindOrCreate<Pldx::ConfigurationFeedback>(
+            Pldx::CONFIGURATION_FEEDBACK_TOPIC);
         RegisterTopicCallback<Pldx::ConfigurationFeedback,
                               &DualBoard::OnConfigurationFeedback>(
             Pldx::CONFIGURATION_FEEDBACK_TOPIC);
       }
+      LibXR::Topic::FindOrCreate<float>("yawmotor_angle");
+      LibXR::Topic::FindOrCreate<float>("pitchmotor_angle");
       RegisterTopicCallback<float, &DualBoard::OnLocalYawAngle>(
           "yawmotor_angle");
       RegisterTopicCallback<float, &DualBoard::OnLocalPitchAngle>(
