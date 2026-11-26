@@ -5,7 +5,7 @@
 module_description: 双板定频 CAN 业务帧模块，通过 LibXR Topic 保持上层接口并使用 Classic CAN 固定帧同步双板状态
 depends:
 - id: GUET-PLDX/CMD
-  ref: e496fc2fadb49d90bd2924432c46d140efdba3a0
+  ref: 84bb49892e595d373ba6d450142925a16bc50677
 - id: GUET-PLDX/Chassis
   ref: 1225795a0b621c9293f8817a7a0cc2795c74ffa9
 - id: GUET-PLDX/PowerControl
@@ -101,14 +101,32 @@ inline bool UsesChassisVelocity(Mode mode) {
          mode == Mode::HOLE;
 }
 
+inline Mode SelectRequestedMode(const CMD::ChassisControl& control,
+                                Mode legacy_mode) {
+  if (!control.explicit_requests) {
+    return legacy_mode;
+  }
+  switch (control.motion) {
+    case CMD::ChassisMotion::FOLLOW:
+      return Mode::FOLLOW;
+    case CMD::ChassisMotion::ROTOR:
+      return Mode::ROTOR;
+    default:
+      return Mode::RELAX;
+  }
+}
+
 inline Mode SelectOutputMode(Mode rc_mode, bool nav_valid, Mode nav_mode,
                              bool auto_ctrl, bool ai_chassis_online,
-                             bool rc_lost) {
-  if (rc_lost) {
+                             bool rc_lost, bool explicit_requests = false) {
+  if (rc_lost || (explicit_requests && rc_mode == Mode::RELAX)) {
     return Mode::RELAX;
   }
   if (auto_ctrl && ai_chassis_online && nav_valid) {
     return nav_mode == Mode::HOLE ? Mode::RELAX : nav_mode;
+  }
+  if (auto_ctrl && explicit_requests) {
+    return Mode::RELAX;
   }
   if (auto_ctrl && rc_mode == Mode::HOLE) {
     return Mode::RELAX;
@@ -123,6 +141,8 @@ struct ConfigurationInput {
   float yaw_rad = 0.0F;
   bool feedback_valid = false;
   uint64_t yaw_sample_us = 0U;
+  bool explicit_requests = false;
+  bool folded_request = false;
 };
 
 struct ConfigurationOutput {
@@ -134,27 +154,33 @@ struct ConfigurationOutput {
 class ConfigurationControl {
  public:
   ConfigurationOutput Step(const ConfigurationInput& input) {
+    const bool supported_request =
+        input.explicit_requests
+            ? (input.request == Mode::FOLLOW || input.request == Mode::ROTOR)
+            : (input.request == Mode::HOLE || input.request == Mode::ROTOR);
     if (!input.feedback_valid || !std::isfinite(input.yaw_rad) ||
-        input.yaw_sample_us == 0U ||
-        (input.request != Mode::HOLE && input.request != Mode::ROTOR)) {
+        input.yaw_sample_us == 0U || !supported_request) {
       Reset();
       return {};
     }
 
-    if (input.request == Mode::HOLE || input.position != LifterPosition::TOP) {
+    const bool folded_request = input.explicit_requests
+                                    ? input.folded_request
+                                    : input.request == Mode::HOLE;
+    if (folded_request || input.position != LifterPosition::TOP) {
       rotor_allowed_ = false;
       const bool aligned = IsSettled(input, Mode::HOLE, HOLE_ANGLE_RAD);
-      if (input.request == Mode::HOLE) {
+      if (folded_request) {
         return {Mode::HOLE, aligned ? FoldAction::BOTTOM : FoldAction::HOLD,
                 aligned && input.position == LifterPosition::BOTTOM};
       }
       return {Mode::HOLE, aligned ? FoldAction::TOP : FoldAction::HOLD};
     }
 
-    if (!rotor_allowed_) {
+    if (input.request == Mode::FOLLOW || !rotor_allowed_) {
       rotor_allowed_ = IsSettled(input, Mode::FOLLOW, 0.0F);
     }
-    return {rotor_allowed_ ? Mode::ROTOR : Mode::FOLLOW, FoldAction::TOP};
+    return {rotor_allowed_ ? input.request : Mode::FOLLOW, FoldAction::TOP};
   }
 
   void Reset() { *this = {}; }
@@ -167,7 +193,8 @@ class ConfigurationControl {
   bool IsSettled(const ConfigurationInput& input, Mode mode, float target_rad) {
     const float error = std::remainder(input.yaw_rad - target_rad,
                                        2.0F * std::numbers::pi_v<float>);
-    if (input.actual_mode != mode || std::abs(error) > ALIGNMENT_TOLERANCE_RAD) {
+    if (input.actual_mode != mode ||
+        std::abs(error) > ALIGNMENT_TOLERANCE_RAD) {
       alignment_mode_ = Mode::RELAX;
       return false;
     }
@@ -1482,12 +1509,14 @@ class DualBoard {
       }
       state_.local_chassis_command_ = control.command;
       state_.local_control_ = control;
+      const auto requested_mode = Pldx::DualBoardControl::SelectRequestedMode(
+          control,
+          static_cast<Pldx::DualBoardControl::Mode>(state_.rc_chassis_mode_));
       state_.committed_mode_ = Pldx::DualBoardControl::SelectOutputMode(
-          static_cast<Pldx::DualBoardControl::Mode>(state_.rc_chassis_mode_),
-          state_.nav_mode_valid_,
+          requested_mode, state_.nav_mode_valid_,
           static_cast<Pldx::DualBoardControl::Mode>(state_.nav_chassis_mode_),
           control.mode == CMD::Mode::CMD_AUTO_CTRL, control.ai_chassis_online,
-          !control.rc_online);
+          !control.rc_online, control.explicit_requests);
       state_.local_chassis_command_time_ms_ =
           static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
     } else {
@@ -1961,21 +1990,23 @@ class DualBoard {
             manual_configuration_interlock_ &&
             state_.local_control_.mode == CMD::Mode::CMD_OP_CTRL;
         if (manual_configuration_interlock_) {
-          fold_command.control_revision = state_.local_control_.control_revision;
+          fold_command.control_revision =
+              state_.local_control_.control_revision;
           if (!RC_LOST && manual_configuration) {
             const auto output = SelectManualConfiguration(now_ms);
             selected_mode = output.mode;
             fold_command.action = output.fold;
             configuration_folded = output.folded;
             if (std::isfinite(yaw_angle)) {
-              yaw_angle = std::remainder(yaw_angle,
-                                         static_cast<float>(LibXR::TWO_PI));
+              yaw_angle =
+                  std::remainder(yaw_angle, static_cast<float>(LibXR::TWO_PI));
             }
           } else {
             state_.configuration_control_.Reset();
           }
         }
-        if (RC_LOST || (manual_configuration &&
+        if (RC_LOST || ((manual_configuration ||
+                         state_.local_control_.explicit_requests) &&
                         selected_mode == Pldx::DualBoardControl::Mode::RELAX)) {
           command = {};
         }
@@ -2023,12 +2054,16 @@ class DualBoard {
                            CHASSIS_VELOCITY_TIMEOUT_MS &&
                        !can_bus_fault_.IsSet();
     return state_.configuration_control_.Step(
-        {.request = static_cast<Mode>(state_.rc_chassis_mode_),
+        {.request = state_.local_control_.explicit_requests
+                        ? state_.committed_mode_
+                        : static_cast<Mode>(state_.rc_chassis_mode_),
          .actual_mode = state_.actual_chassis_mode_,
          .position = feedback.position,
          .yaw_rad = feedback.yaw_rad,
          .feedback_valid = valid,
-         .yaw_sample_us = feedback.yaw_sample_us});
+         .yaw_sample_us = feedback.yaw_sample_us,
+         .explicit_requests = state_.local_control_.explicit_requests,
+         .folded_request = state_.local_control_.folded_request});
   }
 
   void SendLauncherFeedbackFrameIfDue(uint32_t now_ms) {

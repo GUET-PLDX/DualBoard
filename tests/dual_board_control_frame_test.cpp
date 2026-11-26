@@ -72,10 +72,9 @@ void RejectsInvalidWireValues() {
 }
 
 void MotionTargetsRoundTrip() {
-  for (Mode mode :
-       {Mode::RELAX, Mode::INDEPENDENT, Mode::ROTOR, Mode::FOLLOW,
-        Mode::NAVIGATION, Mode::ROTOR_VARIABLE, Mode::NAVIGATION_ROTOR,
-        Mode::HOLE}) {
+  for (Mode mode : {Mode::RELAX, Mode::INDEPENDENT, Mode::ROTOR, Mode::FOLLOW,
+                    Mode::NAVIGATION, Mode::ROTOR_VARIABLE,
+                    Mode::NAVIGATION_ROTOR, Mode::HOLE}) {
     Command command{};
     command.mode = mode;
     command.vx = (mode == Mode::NAVIGATION || mode == Mode::NAVIGATION_ROTOR ||
@@ -153,25 +152,25 @@ void SelectsChassisOutputMode() {
   using Pldx::DualBoardControl::SelectOutputMode;
   assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, false, true, true) ==
          Mode::RELAX);
-  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, false, true, false) ==
-         Mode::FOLLOW);
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, false, true,
+                          false) == Mode::FOLLOW);
   assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, true, true, false) ==
          Mode::ROTOR);
-  assert(SelectOutputMode(Mode::FOLLOW, false, Mode::ROTOR, true, true, false) ==
-         Mode::FOLLOW);
-  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, true, false, false) ==
-         Mode::FOLLOW);
+  assert(SelectOutputMode(Mode::FOLLOW, false, Mode::ROTOR, true, true,
+                          false) == Mode::FOLLOW);
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::ROTOR, true, false,
+                          false) == Mode::FOLLOW);
 
   assert(SelectOutputMode(Mode::FOLLOW, true, Mode::HOLE, true, true, false) ==
          Mode::RELAX);
-  assert(SelectOutputMode(Mode::HOLE, true, Mode::NAVIGATION, false, true, false) ==
-         Mode::HOLE);
-  assert(SelectOutputMode(Mode::HOLE, true, Mode::NAVIGATION, false, true, true) ==
-         Mode::RELAX);
-  assert(SelectOutputMode(Mode::HOLE, true, Mode::NAVIGATION, true, true, false) ==
-         Mode::NAVIGATION);
-  assert(SelectOutputMode(Mode::HOLE, true, Mode::NAVIGATION, true, false, false) ==
-         Mode::RELAX);
+  assert(SelectOutputMode(Mode::HOLE, true, Mode::NAVIGATION, false, true,
+                          false) == Mode::HOLE);
+  assert(SelectOutputMode(Mode::HOLE, true, Mode::NAVIGATION, false, true,
+                          true) == Mode::RELAX);
+  assert(SelectOutputMode(Mode::HOLE, true, Mode::NAVIGATION, true, true,
+                          false) == Mode::NAVIGATION);
+  assert(SelectOutputMode(Mode::HOLE, true, Mode::NAVIGATION, true, false,
+                          false) == Mode::RELAX);
 }
 
 void MapsManualHoleVelocityInFoldedFrontFrame() {
@@ -193,6 +192,37 @@ void MapsManualHoleVelocityInFoldedFrontFrame() {
     assert(std::abs(strafe.vx - direction * COMPONENT_MPS) < 0.001F);
     assert(std::abs(strafe.vy + direction * COMPONENT_MPS) < 0.001F);
   }
+}
+
+void ExplicitRelaxOverridesNavigation() {
+  using Pldx::DualBoardControl::SelectOutputMode;
+  for (Mode navigation :
+       {Mode::NAVIGATION, Mode::NAVIGATION_ROTOR, Mode::HOLE}) {
+    assert(SelectOutputMode(Mode::RELAX, true, navigation, true, true, false,
+                            true) == Mode::RELAX);
+    assert(SelectOutputMode(Mode::RELAX, true, navigation, true, true, false) ==
+           (navigation == Mode::HOLE ? Mode::RELAX : navigation));
+  }
+  assert(SelectOutputMode(Mode::FOLLOW, true, Mode::NAVIGATION, true, true,
+                          false, true) == Mode::NAVIGATION);
+  assert(SelectOutputMode(Mode::ROTOR, false, Mode::NAVIGATION, true, false,
+                          false, true) == Mode::RELAX);
+  assert(SelectOutputMode(Mode::HOLE, false, Mode::NAVIGATION, true, false,
+                          false, true) == Mode::RELAX);
+}
+
+void ExplicitMotionIgnoresLegacyEvents() {
+  using Pldx::DualBoardControl::SelectRequestedMode;
+  CMD::ChassisControl control{};
+  control.motion = CMD::ChassisMotion::ROTOR;
+  assert(SelectRequestedMode(control, Mode::HOLE) == Mode::HOLE);
+  control.explicit_requests = true;
+  assert(SelectRequestedMode(control, Mode::RELAX) == Mode::ROTOR);
+  control.motion = CMD::ChassisMotion::FOLLOW;
+  control.folded_request = true;
+  assert(SelectRequestedMode(control, Mode::ROTOR) == Mode::FOLLOW);
+  control.motion = CMD::ChassisMotion::RELAX;
+  assert(SelectRequestedMode(control, Mode::HOLE) == Mode::RELAX);
 }
 
 void DrivesManualConfigurationInMeasuredOrder() {
@@ -364,6 +394,105 @@ void RepeatedYawSampleDoesNotCountAsSettled() {
   assert(controller.Step(input).fold == FoldAction::BOTTOM);
 }
 
+void SeparatesExplicitMotionFromMeasuredConfiguration() {
+  using Pldx::FoldAction;
+  using Pldx::LifterPosition;
+  using Pldx::DualBoardControl::ConfigurationControl;
+  using Pldx::DualBoardControl::ConfigurationInput;
+  ConfigurationControl controller;
+  ConfigurationInput input{.request = Mode::FOLLOW,
+                           .actual_mode = Mode::FOLLOW,
+                           .position = LifterPosition::TOP,
+                           .feedback_valid = true,
+                           .explicit_requests = true};
+  const auto expect = [&](uint32_t time_ms, Mode mode, FoldAction fold,
+                          bool folded = false) {
+    input.yaw_sample_us = 1U + time_ms * 1000U;
+    const auto output = controller.Step(input);
+    assert(output.mode == mode && output.fold == fold);
+    assert(output.folded == folded);
+  };
+
+  expect(0, Mode::FOLLOW, FoldAction::TOP);
+  expect(50, Mode::FOLLOW, FoldAction::TOP);
+  expect(100, Mode::FOLLOW, FoldAction::TOP);
+  input.request = Mode::ROTOR;
+  input.folded_request = true;
+  expect(110, Mode::HOLE, FoldAction::HOLD);
+  input.actual_mode = Mode::HOLE;
+  input.yaw_rad = 0.78539816F;
+  expect(120, Mode::HOLE, FoldAction::HOLD);
+  expect(170, Mode::HOLE, FoldAction::BOTTOM);
+  input.position = LifterPosition::BOTTOM;
+  expect(180, Mode::HOLE, FoldAction::BOTTOM, true);
+
+  input.request = Mode::FOLLOW;
+  input.folded_request = false;
+  expect(190, Mode::HOLE, FoldAction::TOP);
+  input.position = LifterPosition::TOP;
+  expect(200, Mode::FOLLOW, FoldAction::TOP);
+  input.actual_mode = Mode::FOLLOW;
+  input.yaw_rad = 0.0F;
+  expect(210, Mode::FOLLOW, FoldAction::TOP);
+  expect(260, Mode::FOLLOW, FoldAction::TOP);
+  input.request = Mode::ROTOR;
+  expect(270, Mode::ROTOR, FoldAction::TOP);
+  input.actual_mode = Mode::ROTOR;
+  input.yaw_rad = 1.2F;
+  expect(280, Mode::ROTOR, FoldAction::TOP);
+
+  input.request = Mode::RELAX;
+  input.folded_request = true;
+  expect(290, Mode::RELAX, FoldAction::HOLD);
+  input.request = Mode::FOLLOW;
+  expect(300, Mode::HOLE, FoldAction::HOLD);
+  input.actual_mode = Mode::HOLE;
+  input.yaw_rad = 0.78539816F;
+  expect(310, Mode::HOLE, FoldAction::HOLD);
+  expect(360, Mode::HOLE, FoldAction::BOTTOM);
+  input.position = LifterPosition::MIDDLE;
+  input.folded_request = false;
+  expect(370, Mode::HOLE, FoldAction::TOP);
+  input.yaw_rad = 0.70F;
+  expect(380, Mode::HOLE, FoldAction::HOLD);
+  input.folded_request = true;
+  input.yaw_rad = 0.78539816F;
+  expect(390, Mode::HOLE, FoldAction::HOLD);
+  expect(440, Mode::HOLE, FoldAction::BOTTOM);
+  input.feedback_valid = false;
+  expect(450, Mode::RELAX, FoldAction::HOLD);
+  input.feedback_valid = true;
+  expect(460, Mode::HOLE, FoldAction::HOLD);
+  expect(510, Mode::HOLE, FoldAction::BOTTOM);
+}
+
+void RequiresCurrentFollowAlignmentBeforeRotor() {
+  using Pldx::LifterPosition;
+  using Pldx::DualBoardControl::ConfigurationControl;
+  using Pldx::DualBoardControl::ConfigurationInput;
+  ConfigurationControl controller;
+  ConfigurationInput input{.request = Mode::FOLLOW,
+                           .actual_mode = Mode::FOLLOW,
+                           .position = LifterPosition::TOP,
+                           .feedback_valid = true,
+                           .yaw_sample_us = 1U,
+                           .explicit_requests = true};
+  assert(controller.Step(input).mode == Mode::FOLLOW);
+  input.yaw_sample_us = 50'001U;
+  assert(controller.Step(input).mode == Mode::FOLLOW);
+  input.yaw_rad = 0.3F;
+  input.yaw_sample_us = 60'001U;
+  assert(controller.Step(input).mode == Mode::FOLLOW);
+  input.request = Mode::ROTOR;
+  input.yaw_sample_us = 70'001U;
+  assert(controller.Step(input).mode == Mode::FOLLOW);
+  input.yaw_rad = 0.0F;
+  input.yaw_sample_us = 80'001U;
+  assert(controller.Step(input).mode == Mode::FOLLOW);
+  input.yaw_sample_us = 130'001U;
+  assert(controller.Step(input).mode == Mode::ROTOR);
+}
+
 }  // namespace
 
 int main() {
@@ -374,11 +503,15 @@ int main() {
   NavigationVelocityGoldenVector();
   UseCapacitorFrameRoundTrip();
   SelectsChassisOutputMode();
+  ExplicitRelaxOverridesNavigation();
+  ExplicitMotionIgnoresLegacyEvents();
   MapsManualHoleVelocityInFoldedFrontFrame();
   DrivesManualConfigurationInMeasuredOrder();
   FollowsLatestRequestDuringConfigurationChange();
   StopsAndRestartsFromMeasuredConfiguration();
   RepeatedYawSampleDoesNotCountAsSettled();
+  SeparatesExplicitMotionFromMeasuredConfiguration();
+  RequiresCurrentFollowAlignmentBeforeRotor();
   static_assert(Pldx::DualBoardControl::RESERVED_MASK == 0xF0U);
   static_assert(Pldx::DualBoardControl::USE_CAPACITOR_ID_OFFSET == 0x11U);
 }
