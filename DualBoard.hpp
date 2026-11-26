@@ -5,7 +5,7 @@
 module_description: 双板定频 CAN 业务帧模块，通过 LibXR Topic 保持上层接口并使用 Classic CAN 固定帧同步双板状态
 depends:
 - id: GUET-PLDX/CMD
-  ref: 9d9b7fda740b71eb2525617926664081d3cf27b0
+  ref: d9254a5957d641c0dbceda88eea14c001648c554
 - id: GUET-PLDX/Chassis
   ref: 1225795a0b621c9293f8817a7a0cc2795c74ffa9
 - id: GUET-PLDX/PowerControl
